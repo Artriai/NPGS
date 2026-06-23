@@ -25,7 +25,10 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
     vec4  iBlackHoleRelativeDiskNormal;  //黑洞在相机系下吸积盘法向兼自旋正方向。单位倍Rs
     vec4  iBlackHoleRelativeDiskTangen;  //黑洞在相机系下吸积盘切向。单位倍Rs
 
-    vec4  iCameraVelocity;               //相机坐标速度
+    vec4  iCameraVelocity;               //相机坐标速度（仅有xyz非空。这里使用vec4因为我不知道这个数据怎么对齐的。）
+
+
+
 
     int   iDEBUG;
     int   iPrepass;                      //使用低分辨率插值
@@ -34,8 +37,9 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
     int   iGrid;                         //绘制网格
     int   iEnableHeatHaze;               //热折射
     int   iEnableShadowCulling;          //剔除
-    int   iObserverMode;                 //观者模式，0静态，1落体，2使用外传相机三维平直坐标速度，自动解析为ingoing分量或outgoing分量
+    int   iObserverMode;                 //观者模式，0静态，1落体，2/3正向/反向使用外传相机三维平直坐标速度，自动解析为ingoing分量或outgoing分量；-1使用外部传入的四维相机数据而非三维的。
     int   iPolarization;                 //输出偏振
+    int   iUseImageDisk;                 //在赤道展示图片
 
     float iQuality;                      
 
@@ -2818,9 +2822,6 @@ vec4 DensestarColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
 
             float EmissionTime = iBlackHoleTime + PatternTime;
             
-            // =================================================================
-            // [MOD移植] 物理模式下的中子星 3D 噪声表面纹理生成
-            // =================================================================
             
             // 1. 获取归一化的表面坐标
             vec3 pos_tex = normalize(PatternPos);
@@ -2884,7 +2885,38 @@ vec4 DensestarColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
             float BaseIntensity = pow(BaseTemp_Kelvin / 6000.0, iDensestarBlackbodyIntensityExponent); 
             float RedshiftIntensity = pow(g, iDensestarRedShiftIntensityExponent);
             float FinalIntensity = BaseIntensity * RedshiftIntensity;
+            // =================================================================
+            // ↓↓↓ 测试/调试功能：八卦限颜色与经纬网棋盘格 (取消外部块注释即可生效) ↓↓↓
+            if(iDEBUG==5)
+            {
+                // 获取归一化的随动局部坐标（因为上文 pos_tex 被 *= 4.0 放大过，需还原方向）
+                vec3 unit_pos = normalize(pos_tex);
+                
+                // 1. 八卦限颜色：利用 step 判断 x, y, z 的正负号映射到 RGB
+                vec3 octantColor = step(0.0, unit_pos); 
+                // 为了避免纯黑(0,0,0)卦限看不见，将其映射到 0.2 ~ 1.0 范围
+                octantColor = octantColor * 0.8 + 0.2;  
 
+                // 2. 获取球坐标经纬度
+// 2. 获取球坐标经纬度（包含针对 atan(0,0) 和 asin(>1) 的防 NaN 保护）
+            float phi = atan(unit_pos.z, abs(unit_pos.x) < 1e-9 && abs(unit_pos.z) < 1e-9 ? 1e-9 : unit_pos.x); 
+            float theta = asin(clamp(unit_pos.y, -1.0, 1.0));
+                
+                // 3. 计算棋盘格网格 (调节 6.0 这个系数可改变网格密度)
+                float u = phi * 6.0;   
+                float v = theta * 6.0; 
+                float checker = mod(floor(u) + floor(v), 2.0); // 结果为 0.0 或 1.0
+                
+                // 4. 将棋盘格映射为亮度调节系数（例如暗格亮度 0.3，亮格亮度 1.0）
+                float checkerIntensity = clamp(checker * 0.7 + 0.3,0.0,1.0);
+                
+                // 5. 覆写原物理计算结果 (保留了相对论红蓝移造成的 RedshiftIntensity，方便观察引力透镜和多普勒效应)
+                BlackBodyColor = octantColor;
+                FinalIntensity = checkerIntensity * RedshiftIntensity;
+            }
+            
+            // ↑↑↑ 测试/调试功能结束 ↑↑↑
+            // =================================================================
             vec4 StarCol = vec4(iDensestarBrightmut * BlackBodyColor * FinalIntensity, 1.0);
             
             // 处理负能量光线 / 反宇宙反色
@@ -3779,6 +3811,9 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
     bool bWaitCalBack = false;
     float DistanceToBlackHole = length(RayPosLocal);
     
+
+    vec4 X = vec4(0.0);
+
     if (DistanceToBlackHole > RaymarchingBoundary) //跳过与包围盒间空隙
     {
         vec3 O = RayPosLocal; vec3 D = RayDirWorld_Geo; float r = RaymarchingBoundary - 1.0; 
@@ -3789,7 +3824,7 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
         } 
         else {
             float tEnter = -b - sqrt(delta); 
-            if (tEnter > 0.0) RayPosLocal = O + D * tEnter;
+            if (tEnter > 0.0) {RayPosLocal = O + D * tEnter;X.w-=tEnter;}
             else if (-b + sqrt(delta) <= 0.0) { 
                 bShouldContinueMarchRay = false; 
                 bWaitCalBack = true; 
@@ -3798,7 +3833,7 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
     }
 
 
-    vec4 X = vec4(RayPosLocal, 0.0);
+    X.xyz = RayPosLocal;
 
     vec4 P_cov = vec4(0.0,0.0,0.0,-1.0);
 
@@ -4740,20 +4775,16 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
         {
            if(IsAccretionDiskVisible(iInterRadiusRs, iOuterRadiusRs, iThinRs, iHopper, iBrightmut, iDarkmut))
            {
-               //Result = DiskColor(Result, X, LastX,  P_cov,LastP_cov, E_conserved,
-               //              iInterRadiusRs, iOuterRadiusRs, iThinRs, iHopper, iBrightmut, iDarkmut, iReddening, iSaturation, DiskArgument, 
-               //              iBlackbodyIntensityExponent, iRedShiftColorExponent, iRedShiftIntensityExponent, PeakTemperature, ShiftMax, 
-               //              PhysicalSpinA, 
-               //              PhysicalQ, isoutgoing, 
-               //              ThetaInShell,
-               //              RayMarchPhase,WP_CamX, WP_CamY, StokesQU 
-               //              ); 
+               Result = DiskColor(Result, X, LastX,  P_cov,LastP_cov, E_conserved,
+                             iInterRadiusRs, iOuterRadiusRs, iThinRs, iHopper, iBrightmut, iDarkmut, iReddening, iSaturation, DiskArgument, 
+                             iBlackbodyIntensityExponent, iRedShiftColorExponent, iRedShiftIntensityExponent, PeakTemperature, ShiftMax, 
+                             PhysicalSpinA, 
+                             PhysicalQ, isoutgoing, 
+                             ThetaInShell,
+                             RayMarchPhase,WP_CamX, WP_CamY, StokesQU 
+                             ); 
 
-               Result = ImageDiskColor(Result, X, LastX, P_cov, LastP_cov,
-                                       PhysicalSpinA, PhysicalQ, isoutgoing,
-                                       CurrentUniverseSign, -dLambda/iQuality,
-                                       iInterRadiusRs, iOuterRadiusRs,
-                                       iRedShiftColorExponent, iRedShiftIntensityExponent);
+
            }
            //if(IsJetVisible(iAccretionRate, iJetBrightmut)){
            //    Result = JetColor(Result, ActualStepLength_ingoing, X_ingoing, LastX_ingoing, RayDir_ingoing, LastDir_ingoing, P_cov_ingoing, E_conserved,
@@ -4763,6 +4794,12 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
            //                  RayMarchPhase // <----- 补上被漏掉的这一项
            //                  ); 
            //}
+                          if(iUseImageDisk!=0){Result = ImageDiskColor(Result, X, LastX, P_cov, LastP_cov,
+                                       PhysicalSpinA, PhysicalQ, isoutgoing,
+                                       CurrentUniverseSign, -dLambda/iQuality,
+                                       iInterRadiusRs, iOuterRadiusRs,
+                                       iRedShiftColorExponent, iRedShiftIntensityExponent);
+                                       }
         }
         // if (CurrentUniverseSign > 0.0 && iBlackHoleMassSol > 0.0 &&   int(33+iInWhichUniverse-universeoffset)%3==1       )
         //{
@@ -4786,7 +4823,7 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
         //                     ); 
         //   }
         //}
-        if(iDensestarsurfaceR!=0.0&&(bIsNakedSingularity||iDensestarsurfaceR>EventHorizonR))
+        if(iDensestarsurfaceR!=0.0&&(bIsNakedSingularity||iDensestarsurfaceR>EventHorizonR)&&   int(33+iInWhichUniverse-universeoffset)%3==0       )
         {
             Result = DensestarColor(Result, X, LastX, P_cov,LastP_cov,
                         PhysicalSpinA, 

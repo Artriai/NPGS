@@ -113,7 +113,7 @@ void GameScreen::OnEnter()
         menu->AddLinear("B", &ctx.m_theme.color_accent.z, 0.0f, 1.0f);
         menu->AddThrottle("Fov", &cfov);
         menu->AddLinear("camsmth", &camsmth, 0.0f, 100.0f);
-        menu->AddLinear("DEBUG", &BlackHoleArgs.DEBUG, 0, 4);
+        menu->AddLinear("DEBUG", &BlackHoleArgs.DEBUG, 0, 5);
         menu->AddLinear("Prepass", &BlackHoleArgs.Prepass, 0, 1);
 		menu->AddLinear("Whitehole", &BlackHoleArgs.Whitehole, 0, 1);
 		menu->AddLinear("InWhichUniverse", &BlackHoleArgs.InWhichUniverse, 0, 2);
@@ -122,6 +122,9 @@ void GameScreen::OnEnter()
         menu->AddLinear("EnableShadowCulling", &BlackHoleArgs.EnableShadowCulling, 0, 1);
         menu->AddLinear("Mode", &BlackHoleArgs.ObserverMode, 0, 3);
         menu->AddLinear("Polarization", &BlackHoleArgs.Polarization, 0, 2);
+        menu->AddLinear("UseImageDisk", &BlackHoleArgs.UseImageDisk, 0, 1);
+
+
         menu->AddThrottle("Quality", &BlackHoleArgs.Quality);
         menu->AddThrottle("BlackHoleMassSol", &BlackHoleArgs.BlackHoleMassSol,0.1f);
         menu->AddThrottle("Spin", &BlackHoleArgs.Spin,0.1f);

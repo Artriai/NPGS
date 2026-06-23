@@ -64,6 +64,7 @@ struct FBlackHoleArgs
     int   EnableShadowCulling;
     int   ObserverMode;
     int   Polarization;
+    int   UseImageDisk;
     float Quality;
     float UniverseSign;
     float BlackHoleTime;

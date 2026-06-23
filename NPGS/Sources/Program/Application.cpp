@@ -453,7 +453,7 @@ void FApplication::ExecuteMainRender()
     {
         .Name = "BlackHoleArgs",
         .Fields = { "InverseCamRot;", "BlackHoleRelativePosRs", "BlackHoleRelativeDiskNormal","BlackHoleRelativeDiskTangen","CameraVelocity",
-                    "DEBUG","Prepass","Whitehole","InWhichUniverse","Grid","EnableHeatHaze","EnableShadowCulling", "ObserverMode","Polarization",
+                    "DEBUG","Prepass","Whitehole","InWhichUniverse","Grid","EnableHeatHaze","EnableShadowCulling", "ObserverMode","Polarization","iUseImageDisk",
                     "Quality","UniverseSign",
                      "BlackHoleTime","BlackHoleMassSol", "Spin","Q", "Mu", "AccretionRate","BackShiftMax","DensestarsurfaceR","DensestarBlackbodyIntensityExponent","DensestarRedShiftColorExponent","DensestarRedShiftIntensityExponent","DensestarBrightmut","InterRadiusRs", "OuterRadiusRs","ThinRs","Hopper", "Brightmut","Darkmut","Reddening","Saturation"
                      , "BlackbodyIntensityExponent","RedShiftColorExponent","RedShiftIntensityExponent","PolarizationAngle","HeatHaze","BackgroundBrightmut","PhotonRingBoost","PhotonRingColorTempBoost","BoostRot","JetRedShiftIntensityExponent","JetBrightmut","JetSaturation","JetShiftMax","BlendWeight"},
@@ -1301,8 +1301,10 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.Grid = 0;
 				BlackHoleArgs.EnableHeatHaze = 0;
 				BlackHoleArgs.EnableShadowCulling = 0;
-                BlackHoleArgs.ObserverMode = 1;
+                BlackHoleArgs.ObserverMode = 0;
                 BlackHoleArgs.Polarization = 0.0;
+                BlackHoleArgs.UseImageDisk = 0;
+
                 BlackHoleArgs.Quality = 1.0;
                 BlackHoleArgs.UniverseSign = 1.0;
                 BlackHoleArgs.BlackHoleTime = GameTime * kSpeedOfLight / Rs / kLightYearToMeter;
@@ -1313,7 +1315,7 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.AccretionRate = (2e-4);
 				BlackHoleArgs.BackShiftMax = 1.5f;
 
-                BlackHoleArgs.DensestarsurfaceR = 0.0;
+                BlackHoleArgs.DensestarsurfaceR = 100.0;
                 BlackHoleArgs.DensestarBlackbodyIntensityExponent = 4.0;
                 BlackHoleArgs.DensestarRedShiftColorExponent = 1.0;
                 BlackHoleArgs.DensestarRedShiftIntensityExponent = 4.0;
@@ -1321,7 +1323,7 @@ void FApplication::ExecuteMainRender()
 
 
                 BlackHoleArgs.InterRadiusRs = 0.5;
-                BlackHoleArgs.OuterRadiusRs = 12.0;
+                BlackHoleArgs.OuterRadiusRs = 0.0;
                 BlackHoleArgs.ThinRs = 0.1;
                 BlackHoleArgs.Hopper = 0.0;
                 BlackHoleArgs.Brightmut = 1.0;
@@ -1333,7 +1335,7 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.RedShiftIntensityExponent = 4.0;
                 BlackHoleArgs.PolarizationAngle = 0.0;
 				BlackHoleArgs.HeatHaze = 0.0;
-				BlackHoleArgs.BackgroundBrightmut = 0.0;
+				BlackHoleArgs.BackgroundBrightmut = 0.8;
 				BlackHoleArgs.PhotonRingBoost = 0.0;
 				BlackHoleArgs.PhotonRingColorTempBoost = 0.0;
 				BlackHoleArgs.BoostRot = 0.0;
