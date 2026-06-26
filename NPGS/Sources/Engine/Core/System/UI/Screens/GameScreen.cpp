@@ -120,7 +120,7 @@ void GameScreen::OnEnter()
         menu->AddLinear("Grid", &BlackHoleArgs.Grid, -1, 2);
         menu->AddLinear("EnableHeatHaze", &BlackHoleArgs.EnableHeatHaze, 0, 1);
         menu->AddLinear("EnableShadowCulling", &BlackHoleArgs.EnableShadowCulling, 0, 1);
-        menu->AddLinear("Mode", &BlackHoleArgs.ObserverMode, 0, 3);
+        menu->AddLinear("Mode", &BlackHoleArgs.ObserverMode, -1, 3);
         menu->AddLinear("Polarization", &BlackHoleArgs.Polarization, 0, 2);
         menu->AddLinear("UseImageDisk", &BlackHoleArgs.UseImageDisk, 0, 1);
 

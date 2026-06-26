@@ -21,19 +21,25 @@ layout(set = 0, binding = 0) uniform GameArgs
 layout(set = 0, binding = 1) uniform BlackHoleArgs
 {
     mat4x4 iInverseCamRot;               
-    vec4  iBlackHoleRelativePosRs;       //黑洞在相机系下位置。单位倍Rs
+    vec4  iBlackHoleRelativePosRs;       //黑洞在相机系下位置。单位倍Rs。三维观者模式下直接传入相机三维坐标，着色器会自动将传入的三维信息解析为in/out的空间部分；四维情况下需要传入iCamDataCoordisOutgoing对应的系下的空间坐标。
     vec4  iBlackHoleRelativeDiskNormal;  //黑洞在相机系下吸积盘法向兼自旋正方向。单位倍Rs
     vec4  iBlackHoleRelativeDiskTangen;  //黑洞在相机系下吸积盘切向。单位倍Rs
 
     vec4  iCameraVelocity;               //相机坐标速度（仅有xyz非空。这里使用vec4因为我不知道这个数据怎么对齐的。）
 
 
+                                             
+    vec4  ie1_up;                        //四维相机数据（在mode=-1被使用
+    vec4  ie2_up;                        //四维相机数据（在mode=-1被使用
+    vec4  ie3_up;                        //四维相机数据（在mode=-1被使用
+    vec4  iU_up ;                        //四维相机数据（在mode=-1被使用
 
+    int   iCamDataCoordisOutgoing;       //1代表上述相机和标架信息在outgoing系，0代表ingoing
 
     int   iDEBUG;
     int   iPrepass;                      //使用低分辨率插值
     int   iWhitehole;                    //最大延拓  
-    int   iInWhichUniverse;              //当前最大延拓宇宙编号
+    int   iInWhichUniverse;              //当前最大延拓宇宙编号.分界是II区上边界，即应该在向内进入内视界切换
     int   iGrid;                         //绘制网格
     int   iEnableHeatHaze;               //热折射
     int   iEnableShadowCulling;          //剔除
@@ -45,7 +51,7 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
 
     float iUniverseSign;                 //相机所在空间侧。 +1.0正宇宙  -1.0反宇宙
                         
-    float iBlackHoleTime;                //时间。单位 c*s/Rs
+    float iBlackHoleTime;                //时间。单位 c*s/Rs。三维观者模式下直接传入世界时间，着色器会自动将传入的值解析为in/out ks系的t；四维情况下需要传入iCamDataCoordisOutgoing对应的系下的无穷远坐标时。
     float iBlackHoleMassSol;             //质量，单位倍太阳质量
     float iSpin;                         //无量纲自旋a*   
     float iQ;                            //无量纲电荷Q* 
@@ -527,7 +533,135 @@ vec4 LowerIndex(vec4 P_contra, KerrGeometry geo) {
     return P_flat + geo.f * L_dot_P * geo.l_down;
 }
 
+//inout换系
 
+// 物理常量与数值容差定义
+const float EPS = 1e-16; // 防止除0和对数域爆炸的安全容差
+
+//
+// 笛卡尔 Kerr-Schild 坐标系 Ingoing/Outgoing 相互变换 (Y轴自旋版)
+// 
+// @param X          inout: 四坐标 (x, y, z, T)  (注：y为自旋轴)
+// @param r_sign     in:    径向符号 (+1.0 或 -1.0)
+// @param P          inout: 协变四动量 (p_x, p_y, p_z, p_T)
+// @param M, a, Q    in:    黑洞三毛参数
+// @param out_to_in  in:    false: In->Out;  true: Out->In
+//
+void transformKerrSchild_YSpin(inout vec4 X, in float r_sign, inout vec4 P, 
+                               in float M, in float a, in float Q, in bool out_to_in) 
+{
+    // 1. 提取变量
+    float x = X.x, y = X.y, z = X.z, t = X.w;
+    float px = P.x, py = P.y, pz = P.z, pt = P.w;
+    
+    float a2 = a * a;
+    float M2 = M * M;
+    float Q2 = Q * Q;
+
+    // 2. 解径向方程求 r (Y 为自旋轴)
+    float R2 = x*x + y*y + z*z;
+    float u = R2 - a2;
+    float v = 4.0 * a2 * y * y; 
+    
+    float r2;
+    if (u >= 0.0) {
+        r2 = 0.5 * (u + sqrt(u*u + v));
+    } else {
+        r2 = 0.5 * v / max(1e-20, sqrt(u*u + v) - u);
+    }
+    
+    float r = r_sign * sqrt(max(r2, 0.0));
+
+    // 3. 计算视界函数 Delta 与空间底度规项 D
+    float Delta = r*r - 2.0*M*r + a2 + Q2;
+    float safe_Delta = sign(Delta) * max(abs(Delta), EPS);
+    if (safe_Delta == 0.0) safe_Delta = EPS;
+
+    float r3 = r * r * r;
+    float D = r3 * r + a2 * y * y; // r^4 + a^2 y^2
+    float safe_D = max(D, 1e-12);
+
+    // 4. 计算径向坐标的梯度 r_i (经过 x->z, y->x, z->y 置换)
+    vec3 grad_r = vec3(
+        r3 * x / safe_D,                 // 对应原 y 的梯度形式
+        r * (r*r + a2) * y / safe_D,     // 对应原 z 的梯度形式 (极轴方向)
+        r3 * z / safe_D                  // 对应原 x 的梯度形式
+    );
+
+    // 5. 分析黑洞类型并计算积分函数 F(r) 和 g(r)
+    float delta_disc = M2 - a2 - Q2; 
+    float F_r = 0.0;
+    float g_r = 0.0;
+    float abs_Delta_safe = max(abs(Delta), EPS);
+
+    if (delta_disc > EPS) {
+        // [情形 A: 非极端黑洞]
+        float K = sqrt(delta_disc);
+        float r_plus = M + K;
+        float r_minus = M - K;
+        
+        float frac = abs(r - r_plus) / max(abs(r - r_minus), EPS);
+        float ln_arg = log(max(frac, EPS));
+        float ln_Delta = log(abs_Delta_safe);
+
+        F_r = 2.0 * M * ln_Delta + ((2.0 * M2 - Q2) / K) * ln_arg;
+        g_r = (a / K) * ln_arg;
+        
+    } else if (delta_disc < -EPS) {
+        // [情形 B: 裸奇点 (无视界)]
+        float K = sqrt(-delta_disc);
+        float ln_Delta = log(abs_Delta_safe);
+        float atan_arg = atan((r - M) / K);
+
+        F_r = 2.0 * M * ln_Delta + (2.0 * (2.0 * M2 - Q2) / K) * atan_arg;
+        g_r = (2.0 * a / K) * atan_arg;
+        
+    } else {
+        // [情形 C: 极端黑洞]
+        float rM = r - M;
+        float safe_rM = sign(rM) * max(abs(rM), EPS);
+        if (safe_rM == 0.0) safe_rM = EPS;
+        float ln_rM = log(max(abs(rM), EPS));
+
+        F_r = 4.0 * M * ln_rM - 2.0 * (2.0 * M2 - Q2) / safe_rM;
+        g_r = -2.0 * a / safe_rM;
+    }
+
+    g_r += 2.0 * atan(a, r); 
+    // 6. 计算导数与动量标量 K_p
+    float F_prime = 2.0 * (2.0 * M * r - Q2) / safe_Delta;
+    
+    float g_prime = 2.0 * a / safe_Delta - 2.0 * a / (r * r + a * a);
+
+    // 角动量 Ly (自旋轴为 y，对应的轨道角动量守恒量)
+    float Ly = z * px - x * pz; 
+    float K_p = F_prime * pt + g_prime * Ly;
+
+    // 7. 处理换系方向逻辑
+    float dir = out_to_in ? -1.0 : 1.0; 
+    
+    // 旋转角与时间延迟
+    float angle      = -dir * g_r;
+    float time_shift = -dir * F_r;
+    
+    // 8. 修正空间动量 (利用新的径向梯度)
+    vec3 P_tilde = vec3(px, py, pz) + dir * grad_r * K_p;
+
+    // 9. 旋转矩阵 (作用于 Z-X 平面，绕 Y 轴)
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    // 10. 赋值回原变量 (应用 Z-X 平面的旋转和时间偏移)
+    X.x = x * cos_a + z * sin_a; // 原公式的 y'
+    X.y = y;                     // Y 坐标(自旋轴)不变
+    X.z = z * cos_a - x * sin_a; // 原公式的 x'
+    X.w = t + time_shift;
+
+    P.x =   P_tilde.z * sin_a + P_tilde.x * cos_a;
+    P.y =   P_tilde.y;             // P_y(自旋方向动量)不变
+    P.z = - P_tilde.x * sin_a + P_tilde.z * cos_a;
+    P.w = pt;                    // 能量 Pt 不变
+}
 //初始化ingoing系下光子动量P_u，以向心矢量为主轴做施密特正交化
 vec4 GetInitialMomentum(
     vec3 RayDir,          
@@ -540,7 +674,30 @@ vec4 GetInitialMomentum(
     bool isOutgoing
 )
 {
-
+    if (iObserverMode == -1) {
+        // 在 C++ 中，RayDir传入的是 ViewDirLocal（屏幕视锥方向）
+        vec3 v = normalize(RayDir);
+        
+        // 利用平移输运过来的标架生成光子的四维动量
+        vec4 P_up_cam = iU_up + v.x * ie1_up + v.y * ie2_up + v.z * ie3_up;
+        
+        bool camIsOutgoing = (iCamDataCoordisOutgoing == 1);
+        
+        // 获取相机所在系的度规
+        KerrGeometry geo_cam;
+        ComputeGeometryScalars(X.xyz, PhysicalSpinA, PhysicalQ, GravityFade, universesign, camIsOutgoing, geo_cam);
+        
+        // 降为下指标动量
+        vec4 P_cov_cam = LowerIndex(P_up_cam, geo_cam);
+        
+        // 如果 Shader 当前要求评估的系 (isOutgoing) 与相机所在系不一致，在此换系
+        if (isOutgoing != camIsOutgoing) {
+            vec4 dummyX = X;
+            transformKerrSchild_YSpin(dummyX, universesign, P_cov_cam, CONST_M, PhysicalSpinA, PhysicalQ, isOutgoing);
+        }
+        
+        return P_cov_cam;
+    }
     KerrGeometry geo;
     ComputeGeometryScalars(X.xyz, PhysicalSpinA, PhysicalQ, GravityFade, universesign,isOutgoing, geo);
 
@@ -769,135 +926,7 @@ vec3 DebugInitialMomentum(
 
     return vec3(valid_r, g_chan, b_chan);
 }
-//inout换系
 
-// 物理常量与数值容差定义
-const float EPS = 1e-16; // 防止除0和对数域爆炸的安全容差
-
-//
-// 笛卡尔 Kerr-Schild 坐标系 Ingoing/Outgoing 相互变换 (Y轴自旋版)
-// 
-// @param X          inout: 四坐标 (x, y, z, T)  (注：y为自旋轴)
-// @param r_sign     in:    径向符号 (+1.0 或 -1.0)
-// @param P          inout: 协变四动量 (p_x, p_y, p_z, p_T)
-// @param M, a, Q    in:    黑洞三毛参数
-// @param out_to_in  in:    false: In->Out;  true: Out->In
-//
-void transformKerrSchild_YSpin(inout vec4 X, in float r_sign, inout vec4 P, 
-                               in float M, in float a, in float Q, in bool out_to_in) 
-{
-    // 1. 提取变量
-    float x = X.x, y = X.y, z = X.z, t = X.w;
-    float px = P.x, py = P.y, pz = P.z, pt = P.w;
-    
-    float a2 = a * a;
-    float M2 = M * M;
-    float Q2 = Q * Q;
-
-    // 2. 解径向方程求 r (Y 为自旋轴)
-    float R2 = x*x + y*y + z*z;
-    float u = R2 - a2;
-    float v = 4.0 * a2 * y * y; 
-    
-    float r2;
-    if (u >= 0.0) {
-        r2 = 0.5 * (u + sqrt(u*u + v));
-    } else {
-        r2 = 0.5 * v / max(1e-20, sqrt(u*u + v) - u);
-    }
-    
-    float r = r_sign * sqrt(max(r2, 0.0));
-
-    // 3. 计算视界函数 Delta 与空间底度规项 D
-    float Delta = r*r - 2.0*M*r + a2 + Q2;
-    float safe_Delta = sign(Delta) * max(abs(Delta), EPS);
-    if (safe_Delta == 0.0) safe_Delta = EPS;
-
-    float r3 = r * r * r;
-    float D = r3 * r + a2 * y * y; // r^4 + a^2 y^2
-    float safe_D = max(D, 1e-12);
-
-    // 4. 计算径向坐标的梯度 r_i (经过 x->z, y->x, z->y 置换)
-    vec3 grad_r = vec3(
-        r3 * x / safe_D,                 // 对应原 y 的梯度形式
-        r * (r*r + a2) * y / safe_D,     // 对应原 z 的梯度形式 (极轴方向)
-        r3 * z / safe_D                  // 对应原 x 的梯度形式
-    );
-
-    // 5. 分析黑洞类型并计算积分函数 F(r) 和 g(r)
-    float delta_disc = M2 - a2 - Q2; 
-    float F_r = 0.0;
-    float g_r = 0.0;
-    float abs_Delta_safe = max(abs(Delta), EPS);
-
-    if (delta_disc > EPS) {
-        // [情形 A: 非极端黑洞]
-        float K = sqrt(delta_disc);
-        float r_plus = M + K;
-        float r_minus = M - K;
-        
-        float frac = abs(r - r_plus) / max(abs(r - r_minus), EPS);
-        float ln_arg = log(max(frac, EPS));
-        float ln_Delta = log(abs_Delta_safe);
-
-        F_r = 2.0 * M * ln_Delta + ((2.0 * M2 - Q2) / K) * ln_arg;
-        g_r = (a / K) * ln_arg;
-        
-    } else if (delta_disc < -EPS) {
-        // [情形 B: 裸奇点 (无视界)]
-        float K = sqrt(-delta_disc);
-        float ln_Delta = log(abs_Delta_safe);
-        float atan_arg = atan((r - M) / K);
-
-        F_r = 2.0 * M * ln_Delta + (2.0 * (2.0 * M2 - Q2) / K) * atan_arg;
-        g_r = (2.0 * a / K) * atan_arg;
-        
-    } else {
-        // [情形 C: 极端黑洞]
-        float rM = r - M;
-        float safe_rM = sign(rM) * max(abs(rM), EPS);
-        if (safe_rM == 0.0) safe_rM = EPS;
-        float ln_rM = log(max(abs(rM), EPS));
-
-        F_r = 4.0 * M * ln_rM - 2.0 * (2.0 * M2 - Q2) / safe_rM;
-        g_r = -2.0 * a / safe_rM;
-    }
-
-    g_r += 2.0 * atan(a, r); 
-    // 6. 计算导数与动量标量 K_p
-    float F_prime = 2.0 * (2.0 * M * r - Q2) / safe_Delta;
-    
-    float g_prime = 2.0 * a / safe_Delta - 2.0 * a / (r * r + a * a);
-
-    // 角动量 Ly (自旋轴为 y，对应的轨道角动量守恒量)
-    float Ly = z * px - x * pz; 
-    float K_p = F_prime * pt + g_prime * Ly;
-
-    // 7. 处理换系方向逻辑
-    float dir = out_to_in ? -1.0 : 1.0; 
-    
-    // 旋转角与时间延迟
-    float angle      = -dir * g_r;
-    float time_shift = -dir * F_r;
-    
-    // 8. 修正空间动量 (利用新的径向梯度)
-    vec3 P_tilde = vec3(px, py, pz) + dir * grad_r * K_p;
-
-    // 9. 旋转矩阵 (作用于 Z-X 平面，绕 Y 轴)
-    float cos_a = cos(angle);
-    float sin_a = sin(angle);
-
-    // 10. 赋值回原变量 (应用 Z-X 平面的旋转和时间偏移)
-    X.x = x * cos_a + z * sin_a; // 原公式的 y'
-    X.y = y;                     // Y 坐标(自旋轴)不变
-    X.z = z * cos_a - x * sin_a; // 原公式的 x'
-    X.w = t + time_shift;
-
-    P.x =   P_tilde.z * sin_a + P_tilde.x * cos_a;
-    P.y =   P_tilde.y;             // P_y(自旋方向动量)不变
-    P.z = - P_tilde.x * sin_a + P_tilde.z * cos_a;
-    P.w = pt;                    // 能量 Pt 不变
-}
 
 
 
@@ -3601,10 +3630,14 @@ vec4 GridColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
 
 bool IsAccretionDiskVisible(float InterR, float OuterR, float Thin, float Hopper, float Bright, float Dark)
 {
+    if(iUseImageDisk==0){
     if (InterR >= OuterR) return false;
     if (Thin <= 0.0 && Hopper == 0.0) return false;
     if (Bright <= 0.0 && Dark < 0.0) return false;
-    
+    }else{
+    if (InterR >= OuterR) return false;
+    if (Bright <= 0.0 && Dark < 0.0) return false;
+    }
     return true;
 }
 
@@ -3803,8 +3836,17 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
     mat3 LocalToWorldRot = mat3(BH_X, BH_Y, BH_Z);
     mat3 WorldToLocalRot = transpose(LocalToWorldRot);
     
-    vec3 RayPosLocal = WorldToLocalRot * RayPosWorld;
-    vec3 RayDirWorld_Geo = WorldToLocalRot * normalize((iInverseCamRot * vec4(ViewDirLocal, 0.0)).xyz);
+    vec3 RayPosLocal;
+    vec3 RayDirWorld_Geo;
+
+    if (iObserverMode == -1) {
+        // 测地线模式下，坐标已在正确的局域 KS 系，且射线仅需视锥向量
+        RayPosLocal = iBlackHoleRelativePosRs.xyz; 
+        RayDirWorld_Geo = ViewDirLocal; // 直接使用未经 InverseCamRot 旋转的局部方向
+    } else {
+        RayPosLocal = WorldToLocalRot * RayPosWorld;
+        RayDirWorld_Geo = WorldToLocalRot * normalize((iInverseCamRot * vec4(ViewDirLocal, 0.0)).xyz);
+    }
 
     vec4 Result = vec4(0.0);
     bool bShouldContinueMarchRay = true;
@@ -3989,6 +4031,9 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
     }
     
     bool isoutgoing = false; 
+    if (iObserverMode == -1) {
+        isoutgoing = (iCamDataCoordisOutgoing == 1);
+    }
     //if(iWhitehole==1) isoutgoing=true;//test
     //if (bShouldContinueMarchRay) {
     //    // --- 测试 Ingoing 系 ---
@@ -4134,22 +4179,50 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
         float E_obs = -dot(P_up_wp, U_down); // 光子在观者局部系测量的相对论能量
 
         // 3. 提取相机系下纯粹的屏幕 Right(X轴) 和 Up(Y轴) 初始三维矢量
-        vec3 rawCamRight = vec3(1.0, 0.0, 0.0);
-        vec3 rawCamUp    = vec3(0.0, 1.0, 0.0);
-        vec3 Right_BHLocal = WorldToLocalRot * (iInverseCamRot * vec4(rawCamRight, 0.0)).xyz;
-        vec3 Up_BHLocal    = WorldToLocalRot * (iInverseCamRot * vec4(rawCamUp, 0.0)).xyz;
 
-        // 强行升维 (初始时间分量设为0，相当于无穷远平直时空的坐标轴)
-        vec4 R_up = vec4(Right_BHLocal, 0.0);
-        vec4 Y_up = vec4(Up_BHLocal, 0.0);
-
-        // 4. 执行严谨的 4维 Gram-Schmidt 广义相对论正交化
+        vec4 R_up;
+        vec4 Y_up;
         
-        // 步骤 4.1: 消除时间膨胀分量，确保基底在观者局部标架内是纯空间的 (F · U = 0)
-        R_up += dot(R_up, U_down) * U_up;
-        Y_up += dot(Y_up, U_down) * U_up;
+        if (iObserverMode == -1) {
+            // 直接读取平移输运后的水平和垂直方向四维基底
+            R_up = ie1_up; 
+            Y_up = ie2_up;
+            
+            // 确保其在正确的坐标系下 (因为 Shader 可能已经切换到了相反的系)
+            bool camIsOut = (iCamDataCoordisOutgoing == 1);
+            if (camIsOut != isoutgoing) {
+                KerrGeometry geo_cam;
+                ComputeGeometryScalars(X_wp.xyz, PhysicalSpinA, PhysicalQ, GravityFade, CurrentUniverseSign, camIsOut, geo_cam);
+                vec4 R_down = LowerIndex(R_up, geo_cam);
+                vec4 Y_down = LowerIndex(Y_up, geo_cam);
+                
+                vec4 dummyX1 = X_wp, dummyX2 = X_wp;
+                transformKerrSchild_YSpin(dummyX1, CurrentUniverseSign, R_down, CONST_M, PhysicalSpinA, PhysicalQ, isoutgoing);
+                transformKerrSchild_YSpin(dummyX2, CurrentUniverseSign, Y_down, CONST_M, PhysicalSpinA, PhysicalQ, isoutgoing);
+                
+                R_up = RaiseIndex(R_down, geo_wp);
+                Y_up = RaiseIndex(Y_down, geo_wp);
+            }
+        } else {
+            vec3 rawCamRight = vec3(1.0, 0.0, 0.0);
+            vec3 rawCamUp    = vec3(0.0, 1.0, 0.0);
+            vec3 Right_BHLocal = WorldToLocalRot * (iInverseCamRot * vec4(rawCamRight, 0.0)).xyz;
+            vec3 Up_BHLocal    = WorldToLocalRot * (iInverseCamRot * vec4(rawCamUp, 0.0)).xyz;
+            R_up = vec4(Right_BHLocal, 0.0);
+            Y_up = vec4(Up_BHLocal, 0.0);
+            
+            // 下方原有的正交化流程会对这组基底继续作用...
+        }
+
+        // ======================= [原有逻辑继续] ========================
+        if (iObserverMode != -1) { 
+            // 如果是模式 -1，则 ie1_up 和 ie2_up 在传入时已经被严格 GramSchmidt 正交化过，不需要再次执行
+            R_up += dot(R_up, U_down) * U_up;
+            Y_up += dot(Y_up, U_down) * U_up;
+        }
         vec4 R_down = LowerIndex(R_up, geo_wp);
         vec4 Y_down = LowerIndex(Y_up, geo_wp);
+        // ... (下方 D_up 的剔除逻辑照旧)
 
         // 步骤 4.2: 消除径向分量，确保基底垂直于光子运动方向 (F · P = 0)
         // 构造光子在观者局部系下的纯空间方向 D^mu = P^mu - E * U^mu
@@ -4658,7 +4731,7 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
             bShouldContinueMarchRay = false; bWaitCalBack = false;
             if(iDEBUG==1) Result += vec4(0.3, 0.0, 0.3, 1.0); 
             break;//识别剔除束缚态光子轨道
-        }else if((bIsNakedSingularity&&RadialTurningCounts > 4) || (!bIsNakedSingularity&&universeoffset>3))
+        }else if((bIsNakedSingularity&&RadialTurningCounts > 4) || (!bIsNakedSingularity&&(universeoffset>3||RadialTurningCounts > 8)))
         {
             bShouldContinueMarchRay = false; bWaitCalBack = false;
             if(iDEBUG==1) Result += vec4(0.3, 0.0, 0.3, 1.0); 
@@ -4683,7 +4756,8 @@ TraceResult TraceRay(vec2 FragUv, vec2 Resolution)
                 
                 float PruningCeiling = min(iInterRadiusRs, preCeiling);
                 PruningCeiling = min(PruningCeiling, PhotonShellLimit); 
-                PruningCeiling = min(PruningCeiling, iDensestarsurfaceR); 
+                if(iDensestarsurfaceR!=0.0) PruningCeiling = min(PruningCeiling, iDensestarsurfaceR); 
+                
             
                 if (geo.r < PruningCeiling)
                 {

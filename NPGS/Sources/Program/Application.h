@@ -92,7 +92,7 @@ private:
     bool m_is_beam_button_active;
     bool m_is_rkkv_button_active;
 
-
+    float s_GeodesicThrust = 1.5f;
     std::unique_ptr<System::Spatial::FCamera> _FreeCamera;
     glm::vec3 LastCameraWorldPos = glm::vec3(0.0f); // 用于记录上一帧位置
     bool _bLeftMousePressedInWorld = false;

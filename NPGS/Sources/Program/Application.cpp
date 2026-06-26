@@ -1,8 +1,9 @@
+
 #include "Application.h"
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-
+#include <deque>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_aligned.hpp>
@@ -39,10 +40,612 @@
 #include <glm/gtc/packing.hpp>
 // 添加一个全局的截图请求标志位
 static bool g_bRequestScreenshot = false;
-
+static bool g_GeodesicMode = false; // 新增：测地线模式开关
 
 FGameArgs GameArgs{};
 FBlackHoleArgs BlackHoleArgs{};
+
+
+
+
+static double g_GeoState[20];
+static bool g_isOutgoing = false;
+static double g_UniverseSign = 1.0;
+namespace GeodesicIntegrator
+{
+extern double g_ProperAcceleration[3];
+double g_ProperAcceleration[3] = { 0.0, 0.0, 0.0 };
+double GetIntermediateSign(const double StartX[4], const double CurrentX[4], double CurrentSign, double a)
+{
+    if (StartX[1] * CurrentX[1] < 0.0)
+    {
+        double t = StartX[1] / (StartX[1] - CurrentX[1]);
+        double mix_x = StartX[0] + t * (CurrentX[0] - StartX[0]);
+        double mix_z = StartX[2] + t * (CurrentX[2] - StartX[2]);
+        double rho_cross = std::sqrt(mix_x * mix_x + mix_z * mix_z);
+        if (rho_cross < std::abs(a))
+        {
+            return -CurrentSign;
+        }
+    }
+    return CurrentSign;
+}
+const double EPS = 1e-16;
+// Kerr-Schild 度规计算
+void ComputeMetric(const double X[4], double a, double Q, double fade, double signR, bool isOut, double g_down[4][4], double g_up[4][4], double& r_out)
+{
+    double x = X[0], y = X[1], z = X[2];
+    double a2 = a * a;
+    double R2 = x * x + y * y + z * z;
+    double u_val = R2 - a2;
+    double v = 4.0 * a2 * y * y;
+
+    double r2 = 0.0;
+    if (u_val >= 0.0) r2 = 0.5 * (u_val + std::sqrt(u_val * u_val + v));
+    else r2 = (2.0 * a2 * y * y) / std::max(1e-20, std::sqrt(u_val * u_val + v) - u_val);
+    double r = signR * std::sqrt(std::max(r2, 0.0));
+    r_out = r;
+    double f = 0.0;
+    if (std::abs(r) > 1e-6)
+    {
+        double num = 2.0 * 0.5 * r * r * r - Q * Q * r * r; // M=0.5
+        double den = r * r * r * r + a2 * y * y;
+        f = (num / std::max(1e-20, den)) * fade;
+    }
+    double dir = isOut ? -1.0 : 1.0;
+    double inv = 1.0 / std::max(1e-20, r2 + a2);
+    double lx = (dir * r * x - a * z) * inv;
+    double ly = (dir * y) /r;
+    double lz = (dir * r * z + a * x) * inv;
+    double l[4] = { lx, ly, lz, -1.0 };
+    double l_down_vec[4] = { lx, ly, lz, 1.0 };
+    double eta_down[4] = { 1.0, 1.0, 1.0, -1.0 };
+    double eta_up[4] = { 1.0, 1.0, 1.0, -1.0 };
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            g_down[i][j] = (i == j ? eta_down[i] : 0.0) + f * l_down_vec[i] * l_down_vec[j];
+            g_up[i][j] = (i == j ? eta_up[i] : 0.0) - f * l[i] * l[j];
+        }
+    }
+}
+// 数值差分计算 Christoffel 符号
+// 解析计算 Kerr-Schild 度规的克氏符 (无数值差分，极其稳定且高效)
+void ComputeChristoffel(const double X[4], double a, double Q, double fade, double signR, bool isOut, double Gamma[4][4][4])
+{
+    double x = X[0], y = X[1], z = X[2];
+    double a2 = a * a;
+    double Q2 = Q * Q;
+    double R2 = x * x + y * y + z * z;
+    double u_val = R2 - a2;
+    double v = 4.0 * a2 * y * y;
+
+    // S 代表 sqrt(u^2 + v)，它是导数分母中的核心项。限制最小值防止环奇点除零。
+    double S = std::max(1e-20, std::sqrt(u_val * u_val + v));
+
+    double r2 = 0.0;
+    if (u_val >= 0.0) r2 = 0.5 * (u_val + S);
+    else r2 = (2.0 * a2 * y * y) / std::max(1e-20, S - u_val);
+
+    double r = signR * std::sqrt(std::max(r2, 0.0));
+
+    // 关键优化：引入 Y = y / r，利用代数恒等式严格避免 r->0 时的 0/0 奇点
+    double Y = 0.0;
+    if (std::abs(r) > 1e-10)
+    {
+        Y = y / r;
+    }
+    else
+    {
+        if (std::abs(a) > 1e-20)
+        {
+            double signY = (y >= 0.0) ? 1.0 : -1.0;
+            Y = signY * signR * std::sqrt(std::max(0.0, r2 - u_val)) / std::abs(a);
+        }
+        else
+        {
+            Y = 0.0;
+        }
+    }
+
+    // 1. 计算 r 的空间偏导数 \partial_k r (时间偏导为 0)
+    double dr[4] = { 0.0 };
+    dr[0] = (r * x) / S;
+    dr[1] = (Y * (r2 + a2)) / S; // 原本是 y*(r^2+a^2)/(r*S)，用 Y 替换消去 0/0
+    dr[2] = (r * z) / S;
+    dr[3] = 0.0;
+
+    // 2. 计算纯量 f 及其空间偏导数 \partial_k f
+    double N = r * r * r - Q2 * r2; // 根据原代码 2*0.5*r^3，M默认=0.5，所以 2M=1.0
+    double D = r2 * r2 + a2 * y * y;
+    double D_inv = 1.0 / std::max(1e-20, D);
+    double f = N * D_inv * fade;
+
+    double df[4] = { 0.0 };
+    for (int k = 0; k < 3; ++k)
+    {
+        double dN_k = (3.0 * r2 - 2.0 * Q2 * r) * dr[k];
+        double dD_k = 4.0 * r * r2 * dr[k];
+        if (k == 1) dD_k += 2.0 * a2 * y; // y 方向独有的偏导项
+        df[k] = (dN_k * D - N * dD_k) * D_inv * D_inv * fade; // 假定 fade 在局部空间常数
+    }
+
+    // 3. 计算类光矢量 l_down 及其空间偏导数 \partial_k l_\mu
+    double dir = isOut ? -1.0 : 1.0;
+    double inv_r2a2 = 1.0 / std::max(1e-20, r2 + a2);
+
+    double l_down[4];
+    l_down[0] = (dir * r * x - a * z) * inv_r2a2;
+    l_down[1] = dir * Y;
+    l_down[2] = (dir * r * z + a * x) * inv_r2a2;
+    l_down[3] = 1.0;
+
+    double dl_down[3][4] = { 0.0 }; // dl_down[k][mu] 表示 \partial_k l_\mu
+    for (int k = 0; k < 3; ++k)
+    {
+        double dinv = -inv_r2a2 * inv_r2a2 * 2.0 * r * dr[k];
+
+        // \partial_k l_0
+        double term0 = dir * x * dr[k];
+        if (k == 0) term0 += dir * r;
+        if (k == 2) term0 -= a;
+        dl_down[k][0] = term0 * inv_r2a2 + (dir * r * x - a * z) * dinv;
+
+        // \partial_k l_1 (高度化简：利用 Kerr-Schild 恒等式极大消去 0/0 奇点)
+        if (k == 0) dl_down[k][1] = -dir * Y * x / S;
+        else if (k == 1) dl_down[k][1] = dir * r * (1.0 - Y * Y) / S;
+        else if (k == 2) dl_down[k][1] = -dir * Y * z / S;
+
+        // \partial_k l_2
+        double term2 = dir * z * dr[k];
+        if (k == 2) term2 += dir * r;
+        if (k == 0) term2 += a;
+        dl_down[k][2] = term2 * inv_r2a2 + (dir * r * z + a * x) * dinv;
+
+        // \partial_k l_3 (l_3 恒为 1.0)
+        dl_down[k][3] = 0.0;
+    }
+
+    // 4. 重建逆度规 g_up (g^{\mu\nu})
+    double eta_up[4] = { 1.0, 1.0, 1.0, -1.0 };
+    double l_up[4] = { l_down[0], l_down[1], l_down[2], -1.0 };
+    double g_up[4][4];
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            g_up[i][j] = (i == j ? eta_up[i] : 0.0) - f * l_up[i] * l_up[j];
+        }
+    }
+
+    // 5. 计算度规偏导数 \partial_k g_{\mu\nu}
+    // 注意：因时空平稳，\partial_t g_{\mu\nu} = dg_down[3][mu][nu] = 0.0
+    double dg_down[4][4][4] = { 0.0 };
+    for (int k = 0; k < 3; ++k)
+    {
+        for (int mu = 0; mu < 4; ++mu)
+        {
+            for (int nu = 0; nu < 4; ++nu)
+            {
+                // g_down = \eta + f * l_mu * l_nu
+                dg_down[k][mu][nu] = df[k] * l_down[mu] * l_down[nu] +
+                    f * dl_down[k][mu] * l_down[nu] +
+                    f * l_down[mu] * dl_down[k][nu];
+            }
+        }
+    }
+
+    // 6. 组装 Christoffel 符号
+    for (int lambda = 0; lambda < 4; ++lambda)
+    {
+        for (int mu = 0; mu < 4; ++mu)
+        {
+            for (int nu = 0; nu < 4; ++nu)
+            {
+                double sum = 0.0;
+                for (int rho = 0; rho < 4; ++rho)
+                {
+                    sum += 0.5 * g_up[lambda][rho] * (dg_down[mu][rho][nu] + dg_down[nu][rho][mu] - dg_down[rho][mu][nu]);
+                }
+                Gamma[lambda][mu][nu] = sum;
+            }
+        }
+    }
+}
+void EvaluateDerivatives(const double Y[20], double a, double Q, double fade, double signR, bool isOut, double dY[20])
+{
+    double Gamma[4][4][4];
+    ComputeChristoffel(Y, a, Q, fade, signR, isOut, Gamma);
+    for (int i = 0; i < 4; ++i) dY[i] = Y[4 + i]; // dx/dtau = u
+    for (int i = 0; i < 4; ++i)
+    {
+        double sum = 0;
+        for (int mu = 0; mu < 4; ++mu)
+            for (int nu = 0; nu < 4; ++nu)
+                sum -= Gamma[i][mu][nu] * Y[4 + mu] * Y[4 + nu];
+
+        // === [新增]：加入固有加速度(火箭推力) a^\mu = \sum a^k E_{(k)}^\mu ===
+        sum += g_ProperAcceleration[0] * Y[8 + i] +
+            g_ProperAcceleration[1] * Y[12 + i] +
+            g_ProperAcceleration[2] * Y[16 + i];
+        dY[4 + i] = sum;
+    }
+    for (int a_idx = 0; a_idx < 3; ++a_idx)
+    { // 平移输运方程
+        int offset = 8 + 4 * a_idx;
+        for (int i = 0; i < 4; ++i)
+        {
+            double sum = 0;
+            for (int mu = 0; mu < 4; ++mu)
+                for (int nu = 0; nu < 4; ++nu)
+                    sum -= Gamma[i][mu][nu] * Y[4 + mu] * Y[offset + nu];
+
+            // === [新增]：Fermi-Walker Transport项 u^\mu a^{(k)} 保证空间基底始终与四维速度正交 ===
+            sum += Y[4 + i] * g_ProperAcceleration[a_idx];
+            dY[offset + i] = sum;
+        }
+    }
+}
+void GramSchmidt(double Y[20], double a, double Q, double fade, double signR, bool isOut)
+{
+    double g_down[4][4], g_up[4][4], dummy_r;
+    ComputeMetric(Y, a, Q, fade, signR, isOut, g_down, g_up, dummy_r);
+    auto dotP = [&](const double* v1, const double* v2)
+    {
+        double sum = 0;
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) sum += g_down[i][j] * v1[i] * v2[j];
+        return sum;
+    };
+
+    // 约束2：严格归一化四维速度 U (必须是类时矢量，U.U 应该为 -1)
+    double normU2 = dotP(Y + 4, Y + 4);
+    double factorU = 1.0 / std::sqrt(std::max(1e-12, std::abs(normU2)));
+    for (int i = 0; i < 4; ++i) Y[4 + i] *= factorU;
+
+    // 再次计算归一化后的 U.U (避免浮点误差累积，获取精确负值用于投影除法)
+    double exact_normU2 = dotP(Y + 4, Y + 4);
+    for (int a_idx = 0; a_idx < 3; ++a_idx)
+    {
+        double* E = Y + 8 + 4 * a_idx;
+
+        // 约束1：空间基底必须严格与 U 正交。数学公式: E' = E - (E.U / U.U) * U
+        double dotEU = dotP(E, Y + 4);
+        double projU = dotEU / std::min(-1e-12, exact_normU2); // exact_normU2 是负数
+        for (int i = 0; i < 4; ++i) E[i] -= projU * Y[4 + i];
+
+        // 约束3：3个空间基底之间必须严格两两正交。
+        for (int b_idx = 0; b_idx < a_idx; ++b_idx)
+        {
+            double* Eb = Y + 8 + 4 * b_idx;
+            double dotEEb = dotP(E, Eb);
+            double normEb2 = dotP(Eb, Eb); // Eb 是类空矢量，理论上是正数
+            // E' = E - (E.Eb / Eb.Eb) * Eb
+            double projEb = dotEEb / std::max(1e-12, normEb2);
+            for (int i = 0; i < 4; ++i) E[i] -= projEb * Eb[i];
+        }
+
+        // 约束2（续）：严格归一化空间基矢 (必须是类空矢量，E.E 应该为 +1)
+        double normE2 = dotP(E, E);
+        double factorE = 1.0 / std::sqrt(std::max(1e-12, std::abs(normE2)));
+        for (int i = 0; i < 4; ++i) E[i] *= factorE;
+    }
+}
+// 与 GLSL 严格一致的换系函数
+void TransformKS(double X[4], double P[4], double signR, double M, double a, double Q, bool out_to_in)
+{
+    double x = X[0], y = X[1], z = X[2], t = X[3];
+    double px = P[0], py = P[1], pz = P[2], pt = P[3];
+    double a2 = a * a, M2 = M * M, Q2 = Q * Q;
+    double R2 = x * x + y * y + z * z;
+    double u = R2 - a2;
+    double v = 4.0 * a2 * y * y;
+    double r2 = (u >= 0.0) ? 0.5 * (u + std::sqrt(u * u + v)) : 0.5 * v / std::max(1e-20, std::sqrt(u * u + v) - u);
+    double r = signR * std::sqrt(std::max(r2, 0.0));
+    double Delta = r * r - 2.0 * M * r + a2 + Q2;
+    double safe_Delta = (Delta >= 0 ? 1 : -1) * std::max(std::abs(Delta), EPS);
+    double D = r * r * r * r + a2 * y * y;
+    double safe_D = std::max(D, 1e-12);
+    double grad_r[3] = { (r * r * r * x) / safe_D, (r * (r * r + a2) * y) / safe_D, (r * r * r * z) / safe_D };
+    double delta_disc = M2 - a2 - Q2;
+    double F_r = 0.0, g_r = 0.0;
+    double abs_Delta_safe = std::max(std::abs(Delta), EPS);
+    if (delta_disc > EPS)
+    {
+        double K = std::sqrt(delta_disc);
+        double frac = std::abs(r - (M + K)) / std::max(std::abs(r - (M - K)), EPS);
+        F_r = 2.0 * M * std::log(abs_Delta_safe) + ((2.0 * M2 - Q2) / K) * std::log(std::max(frac, EPS));
+        g_r = (a / K) * std::log(std::max(frac, EPS));
+    }
+    else if (delta_disc < -EPS)
+    {
+        double K = std::sqrt(-delta_disc);
+        double atan_arg = std::atan((r - M) / K);
+        F_r = 2.0 * M * std::log(abs_Delta_safe) + (2.0 * (2.0 * M2 - Q2) / K) * atan_arg;
+        g_r = (2.0 * a / K) * atan_arg;
+    }
+    else
+    {
+        double rM = r - M;
+        double safe_rM = (rM >= 0 ? 1 : -1) * std::max(std::abs(rM), EPS);
+        F_r = 4.0 * M * std::log(std::max(std::abs(rM), EPS)) - 2.0 * (2.0 * M2 - Q2) / safe_rM;
+        g_r = -2.0 * a / safe_rM;
+    }
+    g_r += 2.0 * std::atan2(a, r);
+    double F_prime = 2.0 * (2.0 * M * r - Q2) / safe_Delta;
+    double g_prime = 2.0 * a / safe_Delta - 2.0 * a / (r * r + a * a);
+    double Ly = z * px - x * pz;
+    double K_p = F_prime * pt + g_prime * Ly;
+    double dir = out_to_in ? -1.0 : 1.0;
+
+    double angle = -dir * g_r;
+    double time_shift = -dir * F_r;
+    double P_tilde[3] = { px + dir * grad_r[0] * K_p, py + dir * grad_r[1] * K_p, pz + dir * grad_r[2] * K_p };
+    double cos_a = std::cos(angle), sin_a = std::sin(angle);
+    X[0] = x * cos_a + z * sin_a;
+    X[1] = y;
+    X[2] = z * cos_a - x * sin_a;
+    X[3] = t + time_shift;
+    P[0] = P_tilde[2] * sin_a + P_tilde[0] * cos_a;
+    P[1] = P_tilde[1];
+    P[2] = -P_tilde[0] * sin_a + P_tilde[2] * cos_a;
+    P[3] = pt;
+}
+// 向量指标升降
+void ChangeIndex(double V[4], const double g[4][4])
+{
+    double out[4] = { 0 };
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j) out[i] += g[i][j] * V[j];
+    for (int i = 0; i < 4; ++i) V[i] = out[i];
+}
+void CheckAndSwitchCoords(double Y[20], double a, double Q, double fade, double& signR, bool& isOut)
+{
+    double g_down[4][4], g_up[4][4], dummy_r;
+    ComputeMetric(Y, a, Q, fade, signR, isOut, g_down, g_up, dummy_r);
+
+    // 计算当前系下的速度分量之和，用于发散判定
+    double current_Sum = 0;
+    for (int i = 0; i < 4; ++i) current_Sum += std::abs(Y[4 + i]);
+
+    double Y_test[20];
+    for (int i = 0; i < 20; ++i) Y_test[i] = Y[i];
+
+    // 1. 将所有向量降指标 (使用原坐标系的 g_down)
+    ChangeIndex(Y_test + 4, g_down);
+    for (int k = 0; k < 3; ++k)
+    {
+        ChangeIndex(Y_test + 8 + 4 * k, g_down);
+    }
+
+    // 2. 提前保存原坐标的完美副本
+    double X_orig[4] = { Y_test[0], Y_test[1], Y_test[2], Y_test[3] };
+
+    // 3. 变换时空坐标 X 本身和四维速度 U 
+    // 这一步执行后，Y_test[0..3] 会被正确更新为目标系的新坐标
+    TransformKS(Y_test, Y_test + 4, signR, 0.5, a, Q, isOut);
+
+    // 4. 变换空间标架 E1, E2, E3
+    // 必须每次喂入原坐标副本 dummyX，确保 Jacobian 矩阵的计算依赖的是原系坐标
+    for (int k = 0; k < 3; ++k)
+    {
+        double dummyX[4] = { X_orig[0], X_orig[1], X_orig[2], X_orig[3] };
+        TransformKS(dummyX, Y_test + 8 + 4 * k, signR, 0.5, a, Q, isOut);
+    }
+
+    // 5. 计算目标系度规并升指标
+    double test_g_down[4][4], test_g_up[4][4];
+    ComputeMetric(Y_test, a, Q, fade, signR, !isOut, test_g_down, test_g_up, dummy_r);
+
+    ChangeIndex(Y_test + 4, test_g_up);
+    for (int k = 0; k < 3; ++k)
+    {
+        ChangeIndex(Y_test + 8 + 4 * k, test_g_up);
+    }
+
+    // 6. 检验目标系是否更加平滑 (发散抑制)
+    double test_Sum = 0;
+    for (int i = 0; i < 4; ++i) test_Sum += std::abs(Y_test[4 + i]);
+
+    if (current_Sum > 2.0 * test_Sum)
+    {
+        // 确实更加平滑，确认换系，将 test 状态覆盖回真实状态 Y
+        for (int i = 0; i < 20; ++i) Y[i] = Y_test[i];
+        isOut = !isOut;
+    }
+}
+void InitializeGeodesicState(glm::vec3 pos, glm::vec3 vel, double a, double Q)
+{
+    g_GeoState[0] = pos.x; g_GeoState[1] = pos.y; g_GeoState[2] = pos.z; g_GeoState[3] = 0.0;
+
+    double g_down[4][4], g_up[4][4], r_out;
+    // 使用当前坐标求出度规张量
+    ComputeMetric(g_GeoState, a, Q, 1.0, g_UniverseSign, g_isOutgoing, g_down, g_up, r_out);
+
+    // ========================================================
+    // 将传入的三维坐标速度(v/c)转换为满足归一化条件的四维速度 U^mu
+    // ========================================================
+    double v_coord[4] = { vel.x, vel.y, vel.z, 1.0 };
+    double V_sq = 0.0;
+
+    // 计算模长平方： V^2 = g_ij * v^i * v^j + 2 * g_it * v^i + g_tt
+    for (int i = 0; i < 4; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            V_sq += g_down[i][j] * v_coord[i] * v_coord[j];
+        }
+    }
+
+    if (V_sq < -1e-6)
+    {
+        // 合法的类时速度 (未超光速)
+        double Ut = 1.0 / std::sqrt(-V_sq);
+        g_GeoState[4] = vel.x * Ut;
+        g_GeoState[5] = vel.y * Ut;
+        g_GeoState[6] = vel.z * Ut;
+        g_GeoState[7] = Ut;
+    }
+    else
+    {
+        // 如果相机移动超光速，或处于能层内无法保持静止，尝试回退
+        if (g_down[3][3] < -1e-6)
+        {
+            // 回退到静态观者
+            g_GeoState[4] = 0; g_GeoState[5] = 0; g_GeoState[6] = 0;
+            g_GeoState[7] = 1.0 / std::sqrt(-g_down[3][3]);
+        }
+        else
+        {
+            // 如果连静态观者都做不到（例如在能层内），强制给一个向内的下落速度以防崩溃
+            double inward_v[4] = { -pos.x * 0.1, -pos.y * 0.1, -pos.z * 0.1, 1.0 };
+            double dV_sq = 0;
+            for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) dV_sq += g_down[i][j] * inward_v[i] * inward_v[j];
+
+            if (dV_sq < 0.0)
+            {
+                double Ut = 1.0 / std::sqrt(-dV_sq);
+                g_GeoState[4] = inward_v[0] * Ut; g_GeoState[5] = inward_v[1] * Ut;
+                g_GeoState[6] = inward_v[2] * Ut; g_GeoState[7] = Ut;
+            }
+            else
+            {
+                g_GeoState[4] = 0; g_GeoState[5] = 0; g_GeoState[6] = 0; g_GeoState[7] = 1.0;
+            }
+        }
+    }
+
+    // 计算四维速度的协变形式 (用于投影计算)
+    double U_down[4] = { 0, 0, 0, 0 };
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            U_down[i] += g_down[i][j] * g_GeoState[4 + j];
+
+    // ========================================================
+    // 构建与 GLSL 完全一致的空间标架 e1, e2, e3
+    // 使用 GLSL 中相同的球面映射切线向量进行正交化
+    // ========================================================
+    glm::vec3 m_r = -glm::normalize(pos);
+    glm::vec3 WorldUp = glm::vec3(0.0, 1.0, 0.0);
+    if (std::abs(glm::dot(m_r, WorldUp)) > 0.999f)
+    {
+        WorldUp = glm::vec3(1.0, 0.0, 0.0);
+    }
+    glm::vec3 m_phi = glm::normalize(glm::cross(WorldUp, m_r));
+    glm::vec3 m_theta = glm::cross(m_phi, m_r);
+
+    // 共用的空间正交化闭包
+    auto projectAndNormalize = [&](double* e, double* e_d)
+    {
+        // e = e + dot(e, U_down) * U_up
+        double dot_e_U = 0.0;
+        for (int i = 0; i < 4; ++i) dot_e_U += e[i] * U_down[i];
+        for (int i = 0; i < 4; ++i) e[i] += dot_e_U * g_GeoState[4 + i];
+
+        // 降指标
+        for (int i = 0; i < 4; ++i)
+        {
+            e_d[i] = 0.0;
+            for (int j = 0; j < 4; ++j) e_d[i] += g_down[i][j] * e[j];
+        }
+
+        // n = sqrt(max(1e-9, dot(e, e_d)))
+        double norm = 0.0;
+        for (int i = 0; i < 4; ++i) norm += e[i] * e_d[i];
+        norm = std::sqrt(std::max(1e-9, norm));
+        for (int i = 0; i < 4; ++i)
+        {
+            e[i] /= norm;
+            e_d[i] /= norm;
+        }
+    };
+
+    double e1[4] = { m_r.x, m_r.y, m_r.z, 0.0 };
+    double e1_d[4];
+    projectAndNormalize(e1, e1_d);
+
+    double e2[4] = { m_theta.x, m_theta.y, m_theta.z, 0.0 };
+    double dot_e2_U = 0.0;
+    for (int i = 0; i < 4; ++i) dot_e2_U += e2[i] * U_down[i];
+    for (int i = 0; i < 4; ++i) e2[i] += dot_e2_U * g_GeoState[4 + i];
+
+    double dot_e2_e1 = 0.0;
+    for (int i = 0; i < 4; ++i) dot_e2_e1 += e2[i] * e1_d[i];
+    for (int i = 0; i < 4; ++i) e2[i] -= dot_e2_e1 * e1[i];
+
+    double e2_d[4];
+    projectAndNormalize(e2, e2_d);
+
+    double e3[4] = { m_phi.x, m_phi.y, m_phi.z, 0.0 };
+    double dot_e3_U = 0.0;
+    for (int i = 0; i < 4; ++i) dot_e3_U += e3[i] * U_down[i];
+    for (int i = 0; i < 4; ++i) e3[i] += dot_e3_U * g_GeoState[4 + i];
+
+    double dot_e3_e1 = 0.0;
+    for (int i = 0; i < 4; ++i) dot_e3_e1 += e3[i] * e1_d[i];
+    for (int i = 0; i < 4; ++i) e3[i] -= dot_e3_e1 * e1[i];
+
+    double dot_e3_e2 = 0.0;
+    for (int i = 0; i < 4; ++i) dot_e3_e2 += e3[i] * e2_d[i];
+    for (int i = 0; i < 4; ++i) e3[i] -= dot_e3_e2 * e2[i];
+
+    double e3_d[4];
+    projectAndNormalize(e3, e3_d);
+
+    // ========================================================
+    // 将 m_r, m_theta, m_phi 的物理标架逆投影回 X, Y, Z 三维笛卡尔基底
+    // 在主循环中计算头偏时，C++使用了 -= 减去这组基底。
+    // 这将完美等价于 GLSL 中：P_up = U_up - (k_r * e1 + k_theta * e2 + k_phi * e3)
+    // 从而消灭模式切换产生的光行差与洛伦兹偏转跳变。
+    // ========================================================
+    for (int i = 0; i < 4; ++i)
+    {
+        g_GeoState[8 + i] = m_r.x * e1[i] + m_theta.x * e2[i] + m_phi.x * e3[i]; // E_x
+        g_GeoState[12 + i] = m_r.y * e1[i] + m_theta.y * e2[i] + m_phi.y * e3[i]; // E_y
+        g_GeoState[16 + i] = m_r.z * e1[i] + m_theta.z * e2[i] + m_phi.z * e3[i]; // E_z
+    }
+    GramSchmidt(g_GeoState, a, Q, 1.0, g_UniverseSign, g_isOutgoing);
+}
+void StepRK4(double dtau, double a, double Q)
+{
+    double fade = 1.0;
+    CheckAndSwitchCoords(g_GeoState, a, Q, fade, g_UniverseSign, g_isOutgoing);
+    double k1[20], k2[20], k3[20], k4[20], Y_temp[20];
+
+    EvaluateDerivatives(g_GeoState, a, Q, fade, g_UniverseSign, g_isOutgoing, k1);
+
+    for (int i = 0; i < 20; ++i) Y_temp[i] = g_GeoState[i] + 0.5 * dtau * k1[i];
+    double sign2 = GetIntermediateSign(g_GeoState, Y_temp, g_UniverseSign, a);
+    EvaluateDerivatives(Y_temp, a, Q, fade, sign2, g_isOutgoing, k2);
+
+    for (int i = 0; i < 20; ++i) Y_temp[i] = g_GeoState[i] + 0.5 * dtau * k2[i];
+    double sign3 = GetIntermediateSign(g_GeoState, Y_temp, g_UniverseSign, a);
+    EvaluateDerivatives(Y_temp, a, Q, fade, sign3, g_isOutgoing, k3);
+
+    for (int i = 0; i < 20; ++i) Y_temp[i] = g_GeoState[i] + dtau * k3[i];
+    double sign4 = GetIntermediateSign(g_GeoState, Y_temp, g_UniverseSign, a);
+    EvaluateDerivatives(Y_temp, a, Q, fade, sign4, g_isOutgoing, k4);
+
+    double oldX[4] = { g_GeoState[0], g_GeoState[1], g_GeoState[2], g_GeoState[3] };
+    for (int i = 0; i < 20; ++i) g_GeoState[i] += (dtau / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]);
+
+    // 更新总宇宙标记
+    g_UniverseSign = GetIntermediateSign(oldX, g_GeoState, g_UniverseSign, a);
+
+    GramSchmidt(g_GeoState, a, Q, fade, g_UniverseSign, g_isOutgoing);
+}
+}
+
+
+
+
+
+
+
+
+
+
 FMatrices Matrices;
 FLightMaterial LightMaterial;
 float cfov = 120.0f;
@@ -416,7 +1019,7 @@ void FApplication::ExecuteMainRender()
         "stage4", TextureAllocationCreateInfo, "stage4.png", vk::Format::eR8G8B8A8Unorm,
         vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
     AssetManager->AddAsset<Art::FTexture2D>(
-        "NPGSTexture", TextureAllocationCreateInfo, "penrose.png", vk::Format::eR8G8B8A8Unorm,
+        "NPGSTexture", TextureAllocationCreateInfo, "nw.png", vk::Format::eR8G8B8A8Unorm,
         vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
 
 
@@ -452,8 +1055,8 @@ void FApplication::ExecuteMainRender()
     Grt::FShaderResourceManager::FUniformBufferCreateInfo BlackHoleArgsCreateInfo
     {
         .Name = "BlackHoleArgs",
-        .Fields = { "InverseCamRot;", "BlackHoleRelativePosRs", "BlackHoleRelativeDiskNormal","BlackHoleRelativeDiskTangen","CameraVelocity",
-                    "DEBUG","Prepass","Whitehole","InWhichUniverse","Grid","EnableHeatHaze","EnableShadowCulling", "ObserverMode","Polarization","iUseImageDisk",
+        .Fields = { "InverseCamRot;", "BlackHoleRelativePosRs", "BlackHoleRelativeDiskNormal","BlackHoleRelativeDiskTangen","CameraVelocity","ie1_up","ie1_up","ie2_up","ie3_up","iU_up",
+                    "iCamDataCoordisOutgoing","DEBUG","Prepass","Whitehole","InWhichUniverse","Grid","EnableHeatHaze","EnableShadowCulling", "ObserverMode","Polarization","iUseImageDisk",
                     "Quality","UniverseSign",
                      "BlackHoleTime","BlackHoleMassSol", "Spin","Q", "Mu", "AccretionRate","BackShiftMax","DensestarsurfaceR","DensestarBlackbodyIntensityExponent","DensestarRedShiftColorExponent","DensestarRedShiftIntensityExponent","DensestarBrightmut","InterRadiusRs", "OuterRadiusRs","ThinRs","Hopper", "Brightmut","Darkmut","Reddening","Saturation"
                      , "BlackbodyIntensityExponent","RedShiftColorExponent","RedShiftIntensityExponent","PolarizationAngle","HeatHaze","BackgroundBrightmut","PhotonRingBoost","PhotonRingColorTempBoost","BoostRot","JetRedShiftIntensityExponent","JetBrightmut","JetSaturation","JetShiftMax","BlendWeight"},
@@ -1315,7 +1918,7 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.AccretionRate = (2e-4);
 				BlackHoleArgs.BackShiftMax = 1.5f;
 
-                BlackHoleArgs.DensestarsurfaceR = 100.0;
+                BlackHoleArgs.DensestarsurfaceR = 0.0;
                 BlackHoleArgs.DensestarBlackbodyIntensityExponent = 4.0;
                 BlackHoleArgs.DensestarRedShiftColorExponent = 1.0;
                 BlackHoleArgs.DensestarRedShiftIntensityExponent = 4.0;
@@ -1438,8 +2041,95 @@ void FApplication::ExecuteMainRender()
             }//else{ _FreeCamera->SetTargetOrbitAxis(glm::vec3(0., -1., -0.)); _FreeCamera->SetTargetOrbitCenter(glm::vec3(0.,0.0*5.586e-5f, 0));
            // }
            // _FreeCamera->ProcessMouseMovement(10, 0);
-            glm::vec3 pos = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kPosition);
-            std::cout << pos.x / Rs << "   " << pos.y / Rs << "   " << pos.z / Rs << std::endl;
+                        // ==================== [修改] 先执行测地线积分以获得当帧最新的准确位置 ====================
+            if (g_GeodesicMode)
+            {
+                float Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
+                double total_dtau = _DeltaTime * TimeRate * kSpeedOfLight / Rs / kLightYearToMeter;
+
+                double dtau_remaining = std::abs(total_dtau);
+                double dtau_sign = (total_dtau >= 0.0) ? 1.0 : -1.0;
+
+                // 限制单帧最大子步数，防止极端 TimeRate 导致主线程卡死
+                const int MAX_SUBSTEPS_PER_FRAME = 1500;
+                int step_count = 0;
+
+                while (dtau_remaining > 1e-9 && step_count < MAX_SUBSTEPS_PER_FRAME)
+                {
+                    double abs_a = std::abs(BlackHoleArgs.Spin * 0.5); // M = 0.5，物理自旋 a = Spin * M
+                    double rho = std::sqrt(g_GeoState[0] * g_GeoState[0] + g_GeoState[2] * g_GeoState[2]);
+                    double r_sq = (rho - abs_a) * (rho - abs_a) + g_GeoState[1] * g_GeoState[1];
+                    double R = std::sqrt(std::max(1e-12, r_sq));
+
+                    double scaled_R = std::max(R / 2.0, 1.0);
+                    double max_dtau_gravity = 0.005 * scaled_R * std::sqrt(scaled_R);
+
+                    double U_spatial_mag = std::sqrt(g_GeoState[4] * g_GeoState[4] + g_GeoState[5] * g_GeoState[5] + g_GeoState[6] * g_GeoState[6]);
+                    double max_dtau_kinematic = (0.05 * R) / std::max(1e-6, U_spatial_mag);
+
+                    double safe_dtau = std::min(max_dtau_gravity, max_dtau_kinematic);
+                    safe_dtau = std::clamp(safe_dtau, 0.0005, 5.0);
+
+                    double current_step = std::min(dtau_remaining, safe_dtau);
+
+                    // 执行单步积分
+                    GeodesicIntegrator::StepRK4(current_step * dtau_sign, BlackHoleArgs.Spin * 0.5, BlackHoleArgs.Q * 0.5);
+
+                    dtau_remaining -= current_step;
+                    step_count++;
+                }
+
+                // 覆盖坐标与时间
+                BlackHoleArgs.BlackHoleRelativePosRs = glm::vec4(g_GeoState[0], g_GeoState[1], g_GeoState[2], g_GeoState[3]);
+                BlackHoleArgs.BlackHoleTime = g_GeoState[3];
+                // 【修复点】：把积分器内部精确处理好的 g_UniverseSign 赋给 BlackHoleArgs，而不是反过来
+                BlackHoleArgs.UniverseSign = g_UniverseSign;
+
+                // 设置 Shader 的读取标志
+                BlackHoleArgs.ObserverMode = -1;
+                BlackHoleArgs.iCamDataCoordisOutgoing = g_isOutgoing ? 1 : 0;
+                BlackHoleArgs.CameraVelocity = glm::vec4(0.0f); // 速度已在四维向量中，置零
+
+                // 提取相机的鼠标旋转，作用于空间基底
+                glm::mat4 headRot = glm::mat4_cast(glm::conjugate(_FreeCamera->GetOrientation()));
+
+                glm::vec4 e1(0), e2(0), e3(0);
+                for (int j = 0; j < 3; ++j)
+                {
+                    glm::vec4 base_j(g_GeoState[8 + 4 * j], g_GeoState[8 + 4 * j + 1], g_GeoState[8 + 4 * j + 2], g_GeoState[8 + 4 * j + 3]);
+                    e1 -= headRot[0][j] * base_j;
+                    e2 -= headRot[1][j] * base_j;
+                    e3 -= headRot[2][j] * base_j;
+                }
+
+                BlackHoleArgs.ie1_up = e1;
+                BlackHoleArgs.ie2_up = e2;
+                BlackHoleArgs.ie3_up = e3;
+                BlackHoleArgs.iU_up = glm::vec4(g_GeoState[4], g_GeoState[5], g_GeoState[6], g_GeoState[7]);
+
+                // 保持 InverseCamRot 依然生效以兼容光线计算
+                BlackHoleArgs.InverseCamRot = headRot;
+            }
+            else
+            {
+                if (BlackHoleArgs.ObserverMode == -1) BlackHoleArgs.ObserverMode = 0;
+            }
+
+
+            // ==================== [修改] 获取最新计算出的坐标后再进行穿越与宇宙判断 ====================
+            glm::vec3 pos;
+             Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
+
+            if (g_GeodesicMode)
+            {
+                // 测地线状态是 Rs 单位，需转回世界单位
+                pos = glm::vec3(g_GeoState[0], g_GeoState[1], g_GeoState[2]) * Rs;
+            }
+            else
+            {
+                pos = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kPosition);
+            }
+
             // 2. 物理参数准备
             float M = 0.5f * Rs;
             float a = BlackHoleArgs.Spin * M;      // 物理自旋 a
@@ -1448,27 +2138,29 @@ void FApplication::ExecuteMainRender()
             float Q2 = Q_phys * Q_phys;
 
             // 获取当前帧相机世界坐标及 UniverseSign 更新逻辑
-            glm::vec3 currentPos = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kPosition);
+            glm::vec3 currentPos = pos;
             if (LastCameraWorldPos.y * currentPos.y <= 0.0f && FrameCount > 1)
             {
                 float denom = LastCameraWorldPos.y - currentPos.y;
-                if (std::abs(denom) >0)
+                if (std::abs(denom) > 0)
                 {
                     float t = LastCameraWorldPos.y / denom;
                     float intersectX = LastCameraWorldPos.x + t * (currentPos.x - LastCameraWorldPos.x);
                     float intersectZ = LastCameraWorldPos.z + t * (currentPos.z - LastCameraWorldPos.z);
                     float rho2 = intersectX * intersectX + intersectZ * intersectZ;
-                    // 奇环判定仅与自旋 a 有关，与 Q 无关
                     if (rho2 < a2)
                     {
-                        BlackHoleArgs.UniverseSign *= -1.0f;
+                        // 【修复点】：仅当漫游模式时才在这里粗略判断穿环，测地模式已经由积分器自行完成了精准翻转
+                        if (!g_GeodesicMode)
+                        {
+                            BlackHoleArgs.UniverseSign *= -1.0f;
+                        }
                     }
                 }
             }
             LastCameraWorldPos = currentPos;
 
             // 3. 从 KS 坐标求解 BL 半径 r
-            // 坐标变换方程中的共焦椭球结构主要由 a 决定，Q 仅改变度规分量系数
             float x2 = pos.x * pos.x;
             float y2 = pos.y * pos.y;
             float z2 = pos.z * pos.z;
@@ -1480,14 +2172,10 @@ void FApplication::ExecuteMainRender()
             float r = std::sqrt(r2) * BlackHoleArgs.UniverseSign;
 
             // 4. 计算 Kerr-Newman 度规函数 f
-            // g_tt = -1 + f. 在 KN 度规中 f = (2Mr - Q^2) / Sigma
-            // 原代码分母计算的是 Sigma * r^2 (即 r^4 + a^2*y^2)，所以分子也要乘 r^2
             float sigma_times_r2 = r2 * r2 + a2 * y2;
             float f = ((2.0f * M * r - Q2) * r2) / sigma_times_r2;
 
-            // ... (前置代码保持不变: M, a, Q_phys, r, f 等计算) ...
-
-             // 5. 计算视界半径
+            // 5. 计算视界半径
             float delta_discriminant = M * M - a2 - Q2;
             float horizon_outer = 0.0f;
             float horizon_inner = 0.0f;
@@ -1501,77 +2189,22 @@ void FApplication::ExecuteMainRender()
             }
             static float s_last_r = r; // 记录上一帧的 BL 半径 r
             // 仅在内视界存在且观测模式为 2 时执行
-            if (!isNakedSingularity && BlackHoleArgs.Whitehole == 1 )
+            if (!isNakedSingularity && BlackHoleArgs.Whitehole == 1)
             {
                 // 若上一帧还在内视界之外，当前帧进入了内视界（向内穿过）
-                if (s_last_r > horizon_inner && r <= horizon_inner&& BlackHoleArgs.UniverseSign==1.0f)
+                if (s_last_r > horizon_inner && r <= horizon_inner && BlackHoleArgs.UniverseSign == 1.0f)
                 {
                     // 在 0 和 1 之间翻转 InWhichUniverse
-                    BlackHoleArgs.InWhichUniverse = (BlackHoleArgs.InWhichUniverse +1)%3;
+                    BlackHoleArgs.InWhichUniverse = (BlackHoleArgs.InWhichUniverse + 1) % 3;
                 }
             }
 
             s_last_r = r; // 逻辑判断完后更新 s_last_r 供下一帧使用
-            // 6. 区域判定 & 观测者限制警告
-            std::string locationStatus = "";
-            std::string warningMsg = "";
 
-            // --- 判定禁止静态观者 ---
-            // 1. 能层内: g_tt > 0 => f > 1.0
-            // 2. 视界间: Delta < 0，r 变为时间坐标，无法保持静止
-            bool isBetweenHorizons = (!isNakedSingularity && r < horizon_outer && r > horizon_inner);
-            if (f > 1.0f || isBetweenHorizons)
-            {
-                warningMsg += " [禁止静态观者]";
-            }
-
-            // --- 判定禁止自由落体观者 (从无穷远静止下落 E=1) ---
-            // 在 KN 度规中，当 2Mr < Q^2 时，引力项被电荷排斥项抵消
-            // 导致从无穷远静止下落的观测者在此半径前速度归零并被弹回
-            if (2.0f * M * r < Q2)
-            {
-                warningMsg += " [禁止自由落体]";
-            }
-
-            // --- 位置描述文本 ---
-            if (r < 0.0f)
-            {
-                locationStatus = "Antiverse (r < 0)";
-            }
-            else if (isNakedSingularity)
-            {
-                locationStatus = "裸奇点周边";
-            }
-            else
-            {
-                if (r > horizon_outer)
-                {
-                    locationStatus = (f > 1.0f) ? "外能层内" : "外静界外";
-                }
-                else if (r > horizon_inner)
-                {
-                    locationStatus = "内外视界间";
-                }
-                else
-                {
-                    // 内视界内部
-                    // 检查是否进入了"排斥力"占主导的区域
-                    if (2.0f * M * r < Q2)
-                        locationStatus = "重力排斥区 (Repulsive Gravity)";
-                    else if (f > 1.0f)
-                        locationStatus = "内能层内";
-                    else
-                        locationStatus = "内静界内";
-                }
-            }
-
-            std::cout << "r/Rs: " << r / Rs
-                << " | Q*: " << BlackHoleArgs.Q
-                << " | " << locationStatus
-                << warningMsg // 追加警告信息
-                << std::endl;
-
-
+            // 紧接着就是：
+            // ShaderResourceManager->UpdateEntrieBuffer(CurrentFrame, "BlackHoleArgs", BlackHoleArgs);
+            // =====================================================================
+            // =====================================================================
 
             ShaderResourceManager->UpdateEntrieBuffer(CurrentFrame, "BlackHoleArgs", BlackHoleArgs);
 
@@ -2566,11 +3199,28 @@ void FApplication::ProcessInput()
     // -----------------------------------------------------------
     // 6. 处理滚轮缩放 (消费 Buffer)
     // -----------------------------------------------------------
+    // -----------------------------------------------------------
+    // 6. 处理滚轮缩放 / 推力控制 (消费 Buffer)
+    // -----------------------------------------------------------
+    // [新增] 用于持久化存储测地模式下的推力大小，初始设为 1.5
+    
+
     if (_buffered_scroll_y != 0.0f)
     {
         if (!bMouseBlocked)
         {
-            _FreeCamera->ProcessMouseScroll(_buffered_scroll_y);
+            if (g_GeodesicMode)
+            {
+                // 测地模式：滚轮控制推力（指数增减，每次滚动改变 20%），体验更平滑
+                s_GeodesicThrust *= std::pow(1.2f, _buffered_scroll_y);
+
+                std::cout << "[Geodesic Mode] Thrust power adjusted to: " << s_GeodesicThrust << std::endl;
+            }
+            else
+            {
+                // 普通模式：滚轮控制相机缩放 (FOV)
+                _FreeCamera->ProcessMouseScroll(_buffered_scroll_y);
+            }
         }
         _buffered_scroll_y = 0.0f;
     }
@@ -2583,12 +3233,39 @@ void FApplication::ProcessInput()
         // 模式切换
         static bool wasTDown = false;
         bool isTDown = glfwGetKey(_Window, GLFW_KEY_T) == GLFW_PRESS;
-        if (isTDown && !wasTDown)
+        if (isTDown && !wasTDown&&!g_GeodesicMode)
         {
             _FreeCamera->ProcessModeChange();
         }
         wasTDown = isTDown;
 
+        // -----------------------------------------------------------------
+        // 模式切换
+        // -----------------------------------------------------------------
+        static bool wasGDown = false;
+        bool isGDown = glfwGetKey(_Window, GLFW_KEY_G) == GLFW_PRESS;
+        if (isGDown && !wasGDown)
+        {
+            g_GeodesicMode = !g_GeodesicMode;
+            if (g_GeodesicMode)
+            {
+                // === [新增]：进入测地模式时，自动把相机切换到自由模式 (Free Camera) ===
+                _FreeCamera->SetCameraMode(false);
+
+                float Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
+                glm::vec3 pos = _FreeCamera->GetCameraVector(SysSpa::FCamera::EVectorType::kPosition) / Rs;
+
+                // 获取相机此刻的物理三维坐标速度 (v/c)
+                glm::vec3 vel = glm::vec3(BlackHoleArgs.CameraVelocity);
+
+                g_isOutgoing = false; // 初始为 Ingoing
+                g_UniverseSign = BlackHoleArgs.UniverseSign;
+
+                // 将位置和速度一起传入测地线积分器
+                GeodesicIntegrator::InitializeGeodesicState(pos, vel, BlackHoleArgs.Spin * 0.5, BlackHoleArgs.Q * 0.5);
+            }
+        }
+        wasGDown = isGDown;
 
         static bool wasPDown = false;
         bool isPDown = glfwGetKey(_Window, GLFW_KEY_P) == GLFW_PRESS;
@@ -2617,18 +3294,54 @@ void FApplication::ProcessInput()
 
         if (!isCtrlDown && !isAltDown)
         {
-            if (glfwGetKey(_Window, GLFW_KEY_W) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kForward);
-            if (glfwGetKey(_Window, GLFW_KEY_S) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kBack);
-            if (glfwGetKey(_Window, GLFW_KEY_A) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kLeft);
-            if (glfwGetKey(_Window, GLFW_KEY_D) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kRight);
-            if (glfwGetKey(_Window, GLFW_KEY_R) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kUp);
-            if (glfwGetKey(_Window, GLFW_KEY_F) == GLFW_PRESS)
-                _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kDown);
+            if (g_GeodesicMode)
+            {
+                // === [新增]：测地线模式下的 WASD 推力 (产生四维固有加速度) ===
+                glm::vec3 accel_cam(0.0f);
+                if (glfwGetKey(_Window, GLFW_KEY_W) == GLFW_PRESS) accel_cam.z -= 1.0f; // Forward
+                if (glfwGetKey(_Window, GLFW_KEY_S) == GLFW_PRESS) accel_cam.z += 1.0f; // Back
+                if (glfwGetKey(_Window, GLFW_KEY_A) == GLFW_PRESS) accel_cam.x -= 1.0f; // Left
+                if (glfwGetKey(_Window, GLFW_KEY_D) == GLFW_PRESS) accel_cam.x += 1.0f; // Right
+                if (glfwGetKey(_Window, GLFW_KEY_R) == GLFW_PRESS) accel_cam.y += 1.0f; // Up
+                if (glfwGetKey(_Window, GLFW_KEY_F) == GLFW_PRESS) accel_cam.y -= 1.0f; // Down
+
+                if (glm::length(accel_cam) > 0.1f)
+                {
+                    accel_cam = glm::normalize(accel_cam);
+
+                    // 将相机的局部推力方向请求通过相机的取向转换到标架(世界)空间
+                    glm::vec3 accel_ship = glm::conjugate(_FreeCamera->GetOrientation()) * accel_cam;
+                    // [修改] 直接使用滚轮调节好的推力大小
+                    float thrust = s_GeodesicThrust;
+                    GeodesicIntegrator::g_ProperAcceleration[0] = accel_ship.x * thrust;
+                    GeodesicIntegrator::g_ProperAcceleration[1] = accel_ship.y * thrust;
+                    GeodesicIntegrator::g_ProperAcceleration[2] = accel_ship.z * thrust;
+                }
+                else
+                {
+                    GeodesicIntegrator::g_ProperAcceleration[0] = 0.0;
+                    GeodesicIntegrator::g_ProperAcceleration[1] = 0.0;
+                    GeodesicIntegrator::g_ProperAcceleration[2] = 0.0;
+                }
+            }
+            else
+            {
+                // === 原有的非物理自由漫游模式(魔法移动) ===
+                if (glfwGetKey(_Window, GLFW_KEY_W) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kForward);
+                if (glfwGetKey(_Window, GLFW_KEY_S) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kBack);
+                if (glfwGetKey(_Window, GLFW_KEY_A) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kLeft);
+                if (glfwGetKey(_Window, GLFW_KEY_D) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kRight);
+                if (glfwGetKey(_Window, GLFW_KEY_R) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kUp);
+                if (glfwGetKey(_Window, GLFW_KEY_F) == GLFW_PRESS)
+                    _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kDown);
+            }
+
+            // Roll 旋转（修改飞船的横滚姿态，无论哪种模式都允许生效）
             if (glfwGetKey(_Window, GLFW_KEY_Q) == GLFW_PRESS)
                 _FreeCamera->ProcessKeyboard(SysSpa::FCamera::EMovement::kRollLeft);
             if (glfwGetKey(_Window, GLFW_KEY_E) == GLFW_PRESS)
@@ -2732,6 +3445,18 @@ void FApplication::HandleScroll(double OffsetX, double OffsetY)
 #include "imgui.h"
 #include <cmath>
 #include <vector>
+// =========================================================================
+// [新增] 轨迹记录数据结构 (基于长度保留)
+// =========================================================================
+struct FTrajectoryPoint
+{
+    glm::vec3 Pos;
+    float UniverseSign;
+    float Odometer; // 该点录入时的历史总里程
+};
+static std::deque<FTrajectoryPoint> g_TrajectoryHistory;
+static float g_TotalOdometer = 0.0f; // 全局总里程表
+
 void FApplication::RenderDebugUI()
 {
     // 如果你已经有全局的 ImGui::Begin()，请确保这里的名字不冲突
@@ -2747,9 +3472,175 @@ void FApplication::RenderDebugUI()
     float a2 = a * a;
     float Q2 = Q * Q;
 
-    // 获取相机位置和朝向，并转化到 Rs 单位空间
-    glm::vec3 camPos = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kPosition) / Rs;
-    glm::vec3 camDir = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kFront);
+    // 获取相机位置、朝向和速度矢量，并转化到 Rs 单位空间
+    // 获取相机位置、朝向和速度矢量，并转化到 Rs 单位空间
+        // 获取相机位置、朝向和速度矢量，并转化到 Rs 单位空间
+    // 获取相机位置、朝向和速度矢量，并转化到 Rs 单位空间
+    glm::vec3 camPos;
+    glm::vec3 camDir;
+    glm::vec3 camVel;
+    float physical_speed = 0.0f; // [新增] 用于保存真实且平滑的物理速度
+
+    if (g_GeodesicMode)
+    {
+        // 测地线数组已经是基于 Rs 的无量纲单位
+        camPos = glm::vec3(g_GeoState[0], g_GeoState[1], g_GeoState[2]);
+        // 提取平行输运并被鼠标旋转后的前向四维向量的空间分量
+        camDir = glm::vec3(BlackHoleArgs.ie3_up.x, BlackHoleArgs.ie3_up.y, BlackHoleArgs.ie3_up.z);
+        if (glm::length(camDir) > 1e-6f) camDir = glm::normalize(camDir);
+
+        // 提取 4-速度的空间部分 (仅保留用于小地图上绘制那条绿色的方向线)
+        camVel = glm::vec3(g_GeoState[4], g_GeoState[5], g_GeoState[6]);
+
+        // ========================================================
+        // [完美修正] 计算相对于全局静态观者 (Static Observer) 的物理速度
+        // ========================================================
+        double g_down[4][4], g_up[4][4], dummy_r;
+        GeodesicIntegrator::ComputeMetric(g_GeoState, a, Q, 1.0, BlackHoleArgs.UniverseSign, g_isOutgoing, g_down, g_up, dummy_r);
+
+        // 计算协变时间分量 U_t (物理意义为静态观者测量的能量 E = -U_t)。
+        // 核心亮点：由于 t 方向是全局 Killing 向量，U_t 在 Ingoing/Outgoing 
+        // 坐标切换时是天然的几何不变量！这保证了速度读数的绝对平滑。
+        double U_t = g_down[3][0] * g_GeoState[4] +
+            g_down[3][1] * g_GeoState[5] +
+            g_down[3][2] * g_GeoState[6] +
+            g_down[3][3] * g_GeoState[7];
+
+        // KS 度规下 g_tt = -1 + f
+        double g_tt = g_down[3][3];
+
+        // 防止除零 (当粒子能量趋于 0 时)
+        double U_t_sq = std::max(1e-12, U_t * U_t);
+
+        // 相对静态观者的速度公式推导：
+        // 洛伦兹因子 gamma = -U_t / sqrt(|g_tt|) 
+        // 代入 v = sqrt(1 - 1/gamma^2) 化简得: v^2 = 1 + g_tt / U_t^2
+        //
+        // 物理表现：
+        // 1. 能层外 (g_tt < 0)：正常区域，公式保证 v < 1
+        // 2. 静界表面 (g_tt = 0)：静态观者自身以光速逃逸，测得一切速度为 v = 1
+        // 3. 能层内 / 视界内 (g_tt > 0)：静态观者变为类空(快子)，测得 v > 1 (超光速)
+        double v_sq = 1.0 + (g_tt / U_t_sq);
+
+        // max(0, v_sq) 防止在正常空间因极端浮点误差产生微小的负值
+        physical_speed = static_cast<float>(std::sqrt(std::max(0.0, v_sq)));
+    }
+    else
+    {
+        camPos = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kPosition) / Rs;
+        camDir = _FreeCamera->GetCameraVector(System::Spatial::FCamera::EVectorType::kFront);
+
+        // 自由非物理模式下，速度就是用操作强行设定的空间位移速度
+        camVel = glm::vec3(BlackHoleArgs.CameraVelocity);
+        physical_speed = glm::length(camVel);
+    }
+    // ==========================================
+// [新增] UI 数据面板 (数值坐标与加速度面板)
+// ==========================================
+// 计算 BL 半径 r (用于显示)
+    float r_ui_b = (camPos.x * camPos.x + camPos.y * camPos.y + camPos.z * camPos.z) - a2;
+    float r_ui_c = a2 * camPos.y * camPos.y;
+    float r_ui2 = 0.5f * (r_ui_b + std::sqrt(r_ui_b * r_ui_b + 4.0f * r_ui_c));
+    float r_ui = std::sqrt(std::max(0.0f, r_ui2)) * BlackHoleArgs.UniverseSign;
+
+    ImGui::Text("--- Coordinates & Physics ---");
+    ImGui::Text("r (BL): %.5f Rs", r_ui);
+    ImGui::Text("x: %.4f | y: %.4f | z: %.4f (Rs)", camPos.x, camPos.y, camPos.z);
+    ImGui::Text("Spin (a*): %.4f | Charge (Q*): %.4f", BlackHoleArgs.Spin, BlackHoleArgs.Q);
+    ImGui::Text("Velocity: %.6f c", physical_speed);
+
+    if (g_GeodesicMode)
+    {
+        ImGui::Separator();
+        ImGui::Text("--- Propulsion ---");
+
+        // 提取固有加速度
+        double ax = GeodesicIntegrator::g_ProperAcceleration[0];
+        double ay = GeodesicIntegrator::g_ProperAcceleration[1];
+        double az = GeodesicIntegrator::g_ProperAcceleration[2];
+        double A_code = s_GeodesicThrust;
+
+        ImGui::Text("Proper Accel: %.4f", A_code);
+
+        if (A_code > 1e-6)
+        {
+            // 在狭义相对论中，恒定固有加速度下达到速度 v 需要的固有时间为: tau = (c/A) * artanh(v/c)
+            // artanh(0.1) ≈ 0.100335
+            double dtau_code = 0.100335 / A_code;
+
+            // 将代码单位时间转换回秒 (物理公式: 1单位时间 = Rs_meters / c )
+            double Rs_meters = Rs * kLightYearToMeter;
+            double tau_phys_sec = dtau_code * (Rs_meters / kSpeedOfLight);
+
+            // 计算玩家在当前倍率(TimeRate)下流逝的现实时间
+            double timeTo01c_sec = tau_phys_sec / std::max(1e-9f, GameArgs.TimeRate);
+
+            if (timeTo01c_sec < 60.0) ImGui::Text("Real time to 0.1c: %.2f sec", timeTo01c_sec);
+            else if (timeTo01c_sec < 3600.0) ImGui::Text("Real time to 0.1c: %.2f min", timeTo01c_sec / 60.0);
+            else if (timeTo01c_sec < 86400.0) ImGui::Text("Real time to 0.1c: %.2f hours", timeTo01c_sec / 3600.0);
+            else if (timeTo01c_sec < 31536000.0) ImGui::Text("Real time to 0.1c: %.2f days", timeTo01c_sec / 86400.0);
+            else ImGui::Text("Real time to 0.1c: %.2f years", timeTo01c_sec / 31536000.0);
+        }
+        else
+        {
+            ImGui::Text("Real time to 0.1c: N/A (No thrust)");
+        }
+    }
+    ImGui::Separator();
+    // ==========================================
+    // ==========================================
+    // 2. 记录轨迹 (基于距离采样与总里程计算)
+    // ==========================================
+    const float MAX_TRAIL_LENGTH = 600.0f; // 轨迹最大保留长度 (Rs)
+    bool shouldRecord = false;
+    float stepDist = 0.0f;
+
+    if (g_TrajectoryHistory.empty())
+    {
+        shouldRecord = true;
+    }
+    else
+    {
+        const auto& lastPt = g_TrajectoryHistory.back();
+        stepDist = glm::distance(camPos, lastPt.Pos);
+
+        // A. 如果发生宇宙跨越，立刻记录以切断连线，且这段突变不计入物理里程
+        if (BlackHoleArgs.UniverseSign != lastPt.UniverseSign)
+        {
+            shouldRecord = true;
+            stepDist = 0.0f;
+        }
+        // B. 如果移动超过了 0.5 Rs
+        else if (stepDist > 0.5f)
+        {
+            shouldRecord = true;
+        }
+        // C. 或者距上次记录已经有了微小位移(防止超低速时太久不更新)
+        else
+        {
+            static float s_LastRecordTime = 0.0f;
+            float currentTime = glfwGetTime();
+            if (currentTime - s_LastRecordTime > 0.1f && stepDist > 0.01f)
+            {
+                shouldRecord = true;
+                s_LastRecordTime = currentTime;
+            }
+        }
+    }
+
+    if (shouldRecord)
+    {
+        g_TotalOdometer += stepDist;
+        g_TrajectoryHistory.push_back({ camPos, BlackHoleArgs.UniverseSign, g_TotalOdometer });
+    }
+
+    // 清理队列：剔除超过最大长度阈值的尾部旧数据
+    while (!g_TrajectoryHistory.empty() &&
+        (g_TotalOdometer - g_TrajectoryHistory.front().Odometer) > MAX_TRAIL_LENGTH)
+    {
+        g_TrajectoryHistory.pop_front();
+    }
+    // ==========================================
 
     // 判断所在宇宙状态与裸奇点
     bool isAntiverse = (BlackHoleArgs.UniverseSign < 0.0f);
@@ -2765,15 +3656,14 @@ void FApplication::RenderDebugUI()
     if (canvas_sz.x < 100.0f) canvas_sz.x = 100.0f;
     if (canvas_sz.y < 50.0f) canvas_sz.y = 50.0f;
 
-    // 2. 绘制背景颜色
+    // 绘制背景颜色
     ImU32 bgColor = isAntiverse ? IM_COL32(40, 10, 15, 255) : IM_COL32(15, 20, 30, 255);
     draw_list->AddRectFilled(canvas_p0, ImVec2(canvas_p0.x + canvas_sz.x, canvas_p0.y + canvas_sz.y), bgColor);
 
     // 划分为左右两个视图
     float halfWidth = canvas_sz.x * 0.5f;
 
-    // === 修改点 1: 调整左图中心位置 ===
-    // 将左图原点移到靠左侧边缘 (留 30 像素防贴边)，只用来展示正半轴
+    // 左图原点移到靠左侧边缘，只用来展示正半轴
     float leftPadding = 30.0f;
     ImVec2 centerSide = ImVec2(canvas_p0.x + leftPadding, canvas_p0.y + canvas_sz.y * 0.5f);
     ImVec2 centerTop = ImVec2(canvas_p0.x + halfWidth * 1.5f, canvas_p0.y + canvas_sz.y * 0.5f);
@@ -2789,22 +3679,22 @@ void FApplication::RenderDebugUI()
 
     // 3. 绘制辅助网格和标题
     ImU32 axisColor = IM_COL32(100, 100, 100, 150);
-
-    // === 修改点 2: 左图的横轴只画右半段 ===
     draw_list->AddLine(ImVec2(centerSide.x, centerSide.y), ImVec2(canvas_p0.x + halfWidth, centerSide.y), axisColor, 1.0f);
     draw_list->AddLine(ImVec2(centerSide.x, canvas_p0.y), ImVec2(centerSide.x, canvas_p0.y + canvas_sz.y), axisColor, 1.0f);
 
-    // 右图辅助线保持不变
     draw_list->AddLine(ImVec2(canvas_p0.x + halfWidth, centerTop.y), ImVec2(canvas_p0.x + canvas_sz.x, centerTop.y), axisColor, 1.0f);
     draw_list->AddLine(ImVec2(centerTop.x, canvas_p0.y), ImVec2(centerTop.x, canvas_p0.y + canvas_sz.y), axisColor, 1.0f);
-    // 中间分隔线
     draw_list->AddLine(ImVec2(canvas_p0.x + halfWidth, canvas_p0.y), ImVec2(canvas_p0.x + halfWidth, canvas_p0.y + canvas_sz.y), IM_COL32(200, 200, 200, 255), 2.0f);
 
-    // 调整左侧标题位置，使其靠着新原点
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Meridian (Y-X) Plane");
     draw_list->AddText(ImVec2(canvas_p0.x + halfWidth + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Top-Down (X-(-Z)) Plane");
     std::string univText = !isAntiverse ? "Status: r > 0 (Universe)" : "Status: r < 0 (Antiverse)";
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 30), !isAntiverse ? IM_COL32(200, 255, 200, 255) : IM_COL32(255, 150, 150, 255), univText.c_str());
+
+    // 图例说明
+    draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 50), IM_COL32(255, 255, 0, 255), "Yellow: Look Dir");
+    draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 65), IM_COL32(0, 255, 0, 255), "Green: Velocity");
+    draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 80), IM_COL32(0, 200, 255, 255), "Cyan: Trajectory (600 Rs)");
 
     ImU32 alphaStandard = isAntiverse ? 25 : 255;
     ImU32 alphaErgo = isAntiverse ? 15 : 200;
@@ -2866,8 +3756,7 @@ void FApplication::RenderDebugUI()
 
     for (int i = 0; i <= segments; ++i)
     {
-        // === 修改点 3: 限制 theta 范围 ===
-        // 原本是 * 2.0f * PI，现在改为只乘 PI (即 0 到 180 度)，这样 sin(theta) 始终为正，只生成右半面数据
+        // 限制 theta 范围只乘 PI (即 0 到 180 度)，只生成右半面数据
         float theta = (static_cast<float>(i) / segments) * 3.14159265f;
         float cosTheta = std::cos(theta);
         float sinTheta = std::sin(theta);
@@ -2918,7 +3807,7 @@ void FApplication::RenderDebugUI()
         else if (prev_ctc_valid) draw_list->AddLine(prev_ctc_out, prev_ctc_in, colCTC, 1.5f);
         prev_ctc_valid = ctc_valid;
 
-        // --- 俯视图绘制 (赤道面) 不受影响 ---
+        // --- 俯视图绘制 (赤道面) ---
         if (i == 0)
         {
             float eq_disc = M * M - Q2;
@@ -2949,28 +3838,13 @@ void FApplication::RenderDebugUI()
 
     if (!isNakedSingularity)
     {
-        // 由于上面 theta 的范围是 [0, PI]，半圆用 ImDrawFlags_Closed 闭合时，会天然沿着 Y 轴画一条直线闭合，非常完美地展现半切面截断效果。
         draw_list->AddPolyline(sideOutPts.data(), sideOutPts.size(), colOuterHorizon, ImDrawFlags_None, 2.0f);
         draw_list->AddPolyline(sideInPts.data(), sideInPts.size(), colInnerHorizon, ImDrawFlags_None, 2.0f);
     }
 
-    // 5. 绘制奇环 (a) (永远完全不透明显示，作为两个宇宙的连接点)
+    // 5. 绘制奇环 (a)
     draw_list->AddCircleFilled(ToSideScreen(std::abs(a), 0.0f), 4.0f, colSingularity);
-    // === 修改点 4: 注释掉左侧对称奇环点的绘制 ===
-    // draw_list->AddCircleFilled(ToSideScreen(-std::abs(a), 0.0f), 4.0f, colSingularity);
     draw_list->AddCircle(centerTop, std::abs(a) * scale, colSingularity, 64, 2.0f);
-
-    // 6. 绘制相机位置和朝向 (由于 Rho 恒大于 0，天然会画在右半图)
-    ImU32 camColor = IM_COL32(255, 255, 0, 255);
-    float rho_cam = std::sqrt(camPos.x * camPos.x + camPos.z * camPos.z);
-    ImVec2 camSidePos = ToSideScreen(rho_cam, camPos.y);
-
-    float drho = (rho_cam > 1e-6f) ? ((camPos.x * camDir.x + camPos.z * camDir.z) / rho_cam) : std::sqrt(camDir.x * camDir.x + camDir.z * camDir.z);
-
-    float camLineLen = std::max(1.5f, camDist * 0.15f);
-    ImVec2 camSideDir = ToSideScreen(rho_cam + drho * camLineLen, camPos.y + camDir.y * camLineLen);
-    ImVec2 camTopPos = ToTopScreen(camPos.x, -camPos.z);
-    ImVec2 camTopDir = ToTopScreen(camPos.x + camDir.x * camLineLen, -camPos.z - camDir.z * camLineLen);
 
     auto IsInCanvas = [&](ImVec2 p)
     {
@@ -2978,13 +3852,81 @@ void FApplication::RenderDebugUI()
             p.y >= canvas_p0.y && p.y <= canvas_p0.y + canvas_sz.y;
     };
 
+    // ==========================================
+    // 6. 绘制轨迹历史 (基于长度渐隐)
+    // ==========================================
+    for (size_t i = 1; i < g_TrajectoryHistory.size(); ++i)
+    {
+        const auto& p1 = g_TrajectoryHistory[i - 1];
+        const auto& p2 = g_TrajectoryHistory[i];
+
+        // 避免跨越奇环/宇宙跳变时出现的长虚假连线
+        if (p1.UniverseSign != p2.UniverseSign) continue;
+
+        // 计算该线段距离最新相机的“累计长度”，从而得到 alpha
+        float trailDepth = g_TotalOdometer - p2.Odometer;
+        float alpha = 1.0f - (trailDepth / MAX_TRAIL_LENGTH);
+        alpha = std::clamp(alpha, 0.0f, 1.0f);
+
+        // 颜色：当前宇宙用青色，不同宇宙用暗红色
+        bool isCurrentUniv = (p1.UniverseSign == BlackHoleArgs.UniverseSign);
+        ImU32 col = isCurrentUniv ? IM_COL32(0, 200, 255, (int)(alpha * 255))
+            : IM_COL32(255, 50, 50, (int)(alpha * 150));
+
+        float rho1 = std::sqrt(p1.Pos.x * p1.Pos.x + p1.Pos.z * p1.Pos.z);
+        float rho2 = std::sqrt(p2.Pos.x * p2.Pos.x + p2.Pos.z * p2.Pos.z);
+
+        ImVec2 s1 = ToSideScreen(rho1, p1.Pos.y);
+        ImVec2 s2 = ToSideScreen(rho2, p2.Pos.y);
+
+        ImVec2 t1 = ToTopScreen(p1.Pos.x, -p1.Pos.z);
+        ImVec2 t2 = ToTopScreen(p2.Pos.x, -p2.Pos.z);
+
+        if (IsInCanvas(s1) || IsInCanvas(s2)) draw_list->AddLine(s1, s2, col, 1.5f);
+        if (IsInCanvas(t1) || IsInCanvas(t2)) draw_list->AddLine(t1, t2, col, 1.5f);
+    }
+
+    // ==========================================
+    // 7. 绘制相机位置、朝向矢量以及速度矢量
+    // ==========================================
+    ImU32 camColor = IM_COL32(255, 255, 0, 255); // 黄色：朝向
+    ImU32 velColor = IM_COL32(0, 255, 0, 255);   // 绿色：速度
+
+    float rho_cam = std::sqrt(camPos.x * camPos.x + camPos.z * camPos.z);
+    ImVec2 camSidePos = ToSideScreen(rho_cam, camPos.y);
+    ImVec2 camTopPos = ToTopScreen(camPos.x, -camPos.z);
+
+    // 计算朝向矢量屏幕坐标
+    float drho = (rho_cam > 1e-6f) ? ((camPos.x * camDir.x + camPos.z * camDir.z) / rho_cam) : std::sqrt(camDir.x * camDir.x + camDir.z * camDir.z);
+    float camLineLen = std::max(1.5f, camDist * 0.15f);
+    ImVec2 camSideDir = ToSideScreen(rho_cam + drho * camLineLen, camPos.y + camDir.y * camLineLen);
+    ImVec2 camTopDir = ToTopScreen(camPos.x + camDir.x * camLineLen, -camPos.z - camDir.z * camLineLen);
+
+    // 计算速度矢量屏幕坐标
+    ImVec2 velSideDir, velTopDir;
+    bool hasVelocity = false;
+    float vLen = glm::length(camVel);
+    if (vLen > 1e-5f)
+    {
+        hasVelocity = true;
+        glm::vec3 vDir = camVel / vLen;
+        // 动态缩放速度线长度 (根据速率伸缩，最大限制3倍朝向基准线，以防飞出屏幕)
+        float drawLen = camLineLen * std::clamp(vLen * 1.5f, 0.5f, 3.0f);
+
+        float vDrho = (rho_cam > 1e-6f) ? ((camPos.x * vDir.x + camPos.z * vDir.z) / rho_cam) : std::sqrt(vDir.x * vDir.x + vDir.z * vDir.z);
+        velSideDir = ToSideScreen(rho_cam + vDrho * drawLen, camPos.y + vDir.y * drawLen);
+        velTopDir = ToTopScreen(camPos.x + vDir.x * drawLen, -camPos.z - vDir.z * drawLen);
+    }
+
     if (IsInCanvas(camSidePos))
     {
+        if (hasVelocity) draw_list->AddLine(camSidePos, velSideDir, velColor, 2.5f);
         draw_list->AddLine(camSidePos, camSideDir, camColor, 2.0f);
         draw_list->AddCircleFilled(camSidePos, 5.0f, camColor);
     }
     if (IsInCanvas(camTopPos))
     {
+        if (hasVelocity) draw_list->AddLine(camTopPos, velTopDir, velColor, 2.5f);
         draw_list->AddLine(camTopPos, camTopDir, camColor, 2.0f);
         draw_list->AddCircleFilled(camTopPos, 5.0f, camColor);
     }

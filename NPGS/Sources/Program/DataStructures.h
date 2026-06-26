@@ -55,6 +55,11 @@ struct FBlackHoleArgs
     glm::vec4 BlackHoleRelativeDiskNormal;
     glm::vec4 BlackHoleRelativeDiskTangen;
     glm::vec4 CameraVelocity;
+    glm::vec4 ie1_up;                  // 四维相机数据
+    glm::vec4 ie2_up;
+    glm::vec4 ie3_up;
+    glm::vec4 iU_up;
+    int   iCamDataCoordisOutgoing;     // 1为outgoing, 0为ingoing
     int   DEBUG;
     int   Prepass;
     int   Whitehole;
