@@ -1,4 +1,3 @@
-
 #include "Application.h"
 #include <cmath>
 #include <cstddef>
@@ -26,6 +25,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <sstream>
 #define GLM_ENABLE_EXPERIMENTAL
 #include <glm/gtx/string_cast.hpp> 
 // 在 Application.cpp 的 #include 区域添加
@@ -41,7 +41,13 @@
 // 添加一个全局的截图请求标志位
 static bool g_bRequestScreenshot = false;
 static bool g_GeodesicMode = false; // 新增：测地线模式开关
-
+static bool g_bHideUIAndMouse = false;
+static std::vector<std::string> g_DiskTextures;
+static int g_CurrentDiskState = -1; // -1 表示使用默认体积盘，>=0 表示当前显示的图片索引
+static float g_OriginalThinRs = 0.0f;
+static float g_OriginalHopper = 0.0f;
+static bool g_DiskStateChanged = false;
+static Npgs::Runtime::Graphics::FVulkanSampler* g_GlobalSampler = nullptr;
 FGameArgs GameArgs{};
 FBlackHoleArgs BlackHoleArgs{};
 
@@ -55,6 +61,8 @@ namespace GeodesicIntegrator
 {
 extern double g_ProperAcceleration[3];
 double g_ProperAcceleration[3] = { 0.0, 0.0, 0.0 };
+extern double g_ProperTime;
+double g_ProperTime = 0.0;
 double GetIntermediateSign(const double StartX[4], const double CurrentX[4], double CurrentSign, double a)
 {
     if (StartX[1] * CurrentX[1] < 0.0)
@@ -82,20 +90,20 @@ void ComputeMetric(const double X[4], double a, double Q, double fade, double si
 
     double r2 = 0.0;
     if (u_val >= 0.0) r2 = 0.5 * (u_val + std::sqrt(u_val * u_val + v));
-    else r2 = (2.0 * a2 * y * y) / std::max(1e-20, std::sqrt(u_val * u_val + v) - u_val);
-    double r = signR * std::sqrt(std::max(r2, 0.0));
+    else r2 = (2.0 * a2 * y * y) / std::fmax(1e-20, std::sqrt(u_val * u_val + v) - u_val);
+    double r = signR * std::sqrt(std::fmax(r2, 0.0));
     r_out = r;
     double f = 0.0;
     if (std::abs(r) > 1e-6)
     {
         double num = 2.0 * 0.5 * r * r * r - Q * Q * r * r; // M=0.5
         double den = r * r * r * r + a2 * y * y;
-        f = (num / std::max(1e-20, den)) * fade;
+        f = (num / std::fmax(1e-20, den)) * fade;
     }
     double dir = isOut ? -1.0 : 1.0;
-    double inv = 1.0 / std::max(1e-20, r2 + a2);
+    double inv = 1.0 / std::fmax(1e-20, r2 + a2);
     double lx = (dir * r * x - a * z) * inv;
-    double ly = (dir * y) /r;
+    double ly = (dir * y) / r;
     double lz = (dir * r * z + a * x) * inv;
     double l[4] = { lx, ly, lz, -1.0 };
     double l_down_vec[4] = { lx, ly, lz, 1.0 };
@@ -122,13 +130,13 @@ void ComputeChristoffel(const double X[4], double a, double Q, double fade, doub
     double v = 4.0 * a2 * y * y;
 
     // S 代表 sqrt(u^2 + v)，它是导数分母中的核心项。限制最小值防止环奇点除零。
-    double S = std::max(1e-20, std::sqrt(u_val * u_val + v));
+    double S = std::fmax(1e-20, std::sqrt(u_val * u_val + v));
 
     double r2 = 0.0;
     if (u_val >= 0.0) r2 = 0.5 * (u_val + S);
-    else r2 = (2.0 * a2 * y * y) / std::max(1e-20, S - u_val);
+    else r2 = (2.0 * a2 * y * y) / std::fmax(1e-20, S - u_val);
 
-    double r = signR * std::sqrt(std::max(r2, 0.0));
+    double r = signR * std::sqrt(std::fmax(r2, 0.0));
 
     // 关键优化：引入 Y = y / r，利用代数恒等式严格避免 r->0 时的 0/0 奇点
     double Y = 0.0;
@@ -141,7 +149,7 @@ void ComputeChristoffel(const double X[4], double a, double Q, double fade, doub
         if (std::abs(a) > 1e-20)
         {
             double signY = (y >= 0.0) ? 1.0 : -1.0;
-            Y = signY * signR * std::sqrt(std::max(0.0, r2 - u_val)) / std::abs(a);
+            Y = signY * signR * std::sqrt(std::fmax(0.0, r2 - u_val)) / std::abs(a);
         }
         else
         {
@@ -159,7 +167,7 @@ void ComputeChristoffel(const double X[4], double a, double Q, double fade, doub
     // 2. 计算纯量 f 及其空间偏导数 \partial_k f
     double N = r * r * r - Q2 * r2; // 根据原代码 2*0.5*r^3，M默认=0.5，所以 2M=1.0
     double D = r2 * r2 + a2 * y * y;
-    double D_inv = 1.0 / std::max(1e-20, D);
+    double D_inv = 1.0 / std::fmax(1e-20, D);
     double f = N * D_inv * fade;
 
     double df[4] = { 0.0 };
@@ -173,7 +181,7 @@ void ComputeChristoffel(const double X[4], double a, double Q, double fade, doub
 
     // 3. 计算类光矢量 l_down 及其空间偏导数 \partial_k l_\mu
     double dir = isOut ? -1.0 : 1.0;
-    double inv_r2a2 = 1.0 / std::max(1e-20, r2 + a2);
+    double inv_r2a2 = 1.0 / std::fmax(1e-20, r2 + a2);
 
     double l_down[4];
     l_down[0] = (dir * r * x - a * z) * inv_r2a2;
@@ -301,7 +309,7 @@ void GramSchmidt(double Y[20], double a, double Q, double fade, double signR, bo
 
     // 约束2：严格归一化四维速度 U (必须是类时矢量，U.U 应该为 -1)
     double normU2 = dotP(Y + 4, Y + 4);
-    double factorU = 1.0 / std::sqrt(std::max(1e-12, std::abs(normU2)));
+    double factorU = 1.0 / std::sqrt(std::fmax(1e-12, std::abs(normU2)));
     for (int i = 0; i < 4; ++i) Y[4 + i] *= factorU;
 
     // 再次计算归一化后的 U.U (避免浮点误差累积，获取精确负值用于投影除法)
@@ -322,13 +330,13 @@ void GramSchmidt(double Y[20], double a, double Q, double fade, double signR, bo
             double dotEEb = dotP(E, Eb);
             double normEb2 = dotP(Eb, Eb); // Eb 是类空矢量，理论上是正数
             // E' = E - (E.Eb / Eb.Eb) * Eb
-            double projEb = dotEEb / std::max(1e-12, normEb2);
+            double projEb = dotEEb / std::fmax(1e-12, normEb2);
             for (int i = 0; i < 4; ++i) E[i] -= projEb * Eb[i];
         }
 
         // 约束2（续）：严格归一化空间基矢 (必须是类空矢量，E.E 应该为 +1)
         double normE2 = dotP(E, E);
-        double factorE = 1.0 / std::sqrt(std::max(1e-12, std::abs(normE2)));
+        double factorE = 1.0 / std::sqrt(std::fmax(1e-12, std::abs(normE2)));
         for (int i = 0; i < 4; ++i) E[i] *= factorE;
     }
 }
@@ -341,22 +349,22 @@ void TransformKS(double X[4], double P[4], double signR, double M, double a, dou
     double R2 = x * x + y * y + z * z;
     double u = R2 - a2;
     double v = 4.0 * a2 * y * y;
-    double r2 = (u >= 0.0) ? 0.5 * (u + std::sqrt(u * u + v)) : 0.5 * v / std::max(1e-20, std::sqrt(u * u + v) - u);
-    double r = signR * std::sqrt(std::max(r2, 0.0));
+    double r2 = (u >= 0.0) ? 0.5 * (u + std::sqrt(u * u + v)) : 0.5 * v / std::fmax(1e-20, std::sqrt(u * u + v) - u);
+    double r = signR * std::sqrt(std::fmax(r2, 0.0));
     double Delta = r * r - 2.0 * M * r + a2 + Q2;
-    double safe_Delta = (Delta >= 0 ? 1 : -1) * std::max(std::abs(Delta), EPS);
+    double safe_Delta = (Delta >= 0 ? 1 : -1) * std::fmax(std::abs(Delta), EPS);
     double D = r * r * r * r + a2 * y * y;
-    double safe_D = std::max(D, 1e-12);
+    double safe_D = std::fmax(D, 1e-12);
     double grad_r[3] = { (r * r * r * x) / safe_D, (r * (r * r + a2) * y) / safe_D, (r * r * r * z) / safe_D };
     double delta_disc = M2 - a2 - Q2;
     double F_r = 0.0, g_r = 0.0;
-    double abs_Delta_safe = std::max(std::abs(Delta), EPS);
+    double abs_Delta_safe = std::fmax(std::abs(Delta), EPS);
     if (delta_disc > EPS)
     {
         double K = std::sqrt(delta_disc);
-        double frac = std::abs(r - (M + K)) / std::max(std::abs(r - (M - K)), EPS);
-        F_r = 2.0 * M * std::log(abs_Delta_safe) + ((2.0 * M2 - Q2) / K) * std::log(std::max(frac, EPS));
-        g_r = (a / K) * std::log(std::max(frac, EPS));
+        double frac = std::abs(r - (M + K)) / std::fmax(std::abs(r - (M - K)), EPS);
+        F_r = 2.0 * M * std::log(abs_Delta_safe) + ((2.0 * M2 - Q2) / K) * std::log(std::fmax(frac, EPS));
+        g_r = (a / K) * std::log(std::fmax(frac, EPS));
     }
     else if (delta_disc < -EPS)
     {
@@ -368,8 +376,8 @@ void TransformKS(double X[4], double P[4], double signR, double M, double a, dou
     else
     {
         double rM = r - M;
-        double safe_rM = (rM >= 0 ? 1 : -1) * std::max(std::abs(rM), EPS);
-        F_r = 4.0 * M * std::log(std::max(std::abs(rM), EPS)) - 2.0 * (2.0 * M2 - Q2) / safe_rM;
+        double safe_rM = (rM >= 0 ? 1 : -1) * std::fmax(std::abs(rM), EPS);
+        F_r = 4.0 * M * std::log(std::fmax(std::abs(rM), EPS)) - 2.0 * (2.0 * M2 - Q2) / safe_rM;
         g_r = -2.0 * a / safe_rM;
     }
     g_r += 2.0 * std::atan2(a, r);
@@ -459,7 +467,7 @@ void InitializeGeodesicState(glm::vec3 pos, glm::vec3 vel, double a, double Q)
 {
     g_GeoState[0] = pos.x; g_GeoState[1] = pos.y; g_GeoState[2] = pos.z; g_GeoState[3] = 0.0;
 
-    double g_down[4][4], g_up[4][4], r_out;
+    double g_down[4][4] = { 0.0 }, g_up[4][4] = {0.0}, r_out=0.0;
     // 使用当前坐标求出度规张量
     ComputeMetric(g_GeoState, a, Q, 1.0, g_UniverseSign, g_isOutgoing, g_down, g_up, r_out);
 
@@ -553,7 +561,7 @@ void InitializeGeodesicState(glm::vec3 pos, glm::vec3 vel, double a, double Q)
         // n = sqrt(max(1e-9, dot(e, e_d)))
         double norm = 0.0;
         for (int i = 0; i < 4; ++i) norm += e[i] * e_d[i];
-        norm = std::sqrt(std::max(1e-9, norm));
+        norm = std::sqrt(std::fmax(1e-9, norm));
         for (int i = 0; i < 4; ++i)
         {
             e[i] /= norm;
@@ -648,8 +656,8 @@ void StepRK4(double dtau, double a, double Q)
 
 FMatrices Matrices;
 FLightMaterial LightMaterial;
-float cfov = 120.0f;
-float camsmth = 30.0f;
+float cfov = 80.0f;
+float camsmth = 1.0f;
 _NPGS_BEGIN
 
 namespace Art = Runtime::Asset;
@@ -662,7 +670,7 @@ double get_orbit_energy(double x, double a, double q2)
     if (x < q2) return 1e100; // 低于理论极限，返回极大罚值防止越界
 
     // sqrt(x - q^2) 是广义相对论测地线方程中提取出的公共项
-    double sq = std::sqrt(std::max(0.0, x - q2));
+    double sq = std::sqrt(std::fmax(0.0, x - q2));
 
     // 分母内部的判别式，其最大根对应光子球 (Photon Sphere)
     double F = x * x - 3.0 * x + 2.0 * q2 + 2.0 * a * sq;
@@ -706,7 +714,7 @@ double calculate_KN_ISCO(double M, double a_star, double Q_star)
     }
 
     // 3. 黄金分割搜索求极小值点 (ISCO 对应 E(x) 曲线的最低点)
-    double left = std::max(1.0, q2) + 1e-5;
+    double left = std::fmax(1.0, q2) + 1e-5;
     double right = 15.0; // ISCO 理论最大值为 9M (逆行极端Kerr)，设 15 为安全上限
 
     const double invphi = (std::sqrt(5.0) - 1.0) / 2.0;
@@ -775,7 +783,144 @@ void FApplication::Quit()
         glfwSetWindowShouldClose(_Window, GLFW_TRUE);
     }
 }
+void FApplication::Command(const std::string& command)
+{
+    if (command.find("/tp ") == 0)
+    {
+        std::istringstream iss(command.substr(4));
+        double x, y, z, t, vx, vy, vz;
+        // 解析形如 "/tp x y z t vx vy vz" 的字符串
+        if (iss >> x >> y >> z >> t >> vx >> vy >> vz)
+        {
+            if (g_GeodesicMode)
+            {
+                // 1. 设置坐标位置与时间 (X^\mu)
+                g_GeoState[0] = x;
+                g_GeoState[1] = y;
+                g_GeoState[2] = z;
+                g_GeoState[3] = t;
+                // 2. 设置空间速度分量 (U^x, U^y, U^z)
+                g_GeoState[4] = vx;
+                g_GeoState[5] = vy;
+                g_GeoState[6] = vz;
+                double a = BlackHoleArgs.Spin * 0.5; // M = 0.5
+                double Q = BlackHoleArgs.Q * 0.5;
 
+                // 强制要求解释为 ingoing kerrschild 系
+                g_isOutgoing = false;
+                // 3. 计算度规张量以求出 U^t
+                double g_down[4][4], g_up[4][4], dummy_r;
+                GeodesicIntegrator::ComputeMetric(g_GeoState, a, Q, 1.0, g_UniverseSign, g_isOutgoing, g_down, g_up, dummy_r);
+                // 解二次方程 g_{\mu\nu} U^\mu U^\nu = -1 求解时间分量 Ut (即 g_GeoState[7])
+                // A * Ut^2 + B * Ut + C = 0
+                double A = g_down[3][3];
+                double B = 2.0 * (g_down[3][0] * vx + g_down[3][1] * vy + g_down[3][2] * vz);
+                double C = 1.0;
+                for (int i = 0; i < 3; ++i)
+                {
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        double ui = (i == 0) ? vx : (i == 1) ? vy : vz;
+                        double uj = (j == 0) ? vx : (j == 1) ? vy : vz;
+                        C += g_down[i][j] * ui * uj;
+                    }
+                }
+                double discriminant = B * B - 4.0 * A * C;
+                double Ut = 1.0;
+                if (discriminant >= 0.0)
+                {
+                    double root1 = (-B - std::sqrt(discriminant)) / (2.0 * A);
+                    double root2 = (-B + std::sqrt(discriminant)) / (2.0 * A);
+                    // 判断哪个解对应的是指向未来的类时矢量 (要求协变能量分量 E = -U_t > 0 => U_t < 0)
+                    auto checkEnergy = [&](double ut_val)
+                    {
+                        return g_down[3][0] * vx + g_down[3][1] * vy + g_down[3][2] * vz + g_down[3][3] * ut_val;
+                    };
+                    double E1 = checkEnergy(root1);
+                    double E2 = checkEnergy(root2);
+                    if (E1 < 0.0 && E2 >= 0.0) Ut = root1;
+                    else if (E2 < 0.0 && E1 >= 0.0) Ut = root2;
+                    else Ut = std::fmax(root1, root2); // Fallback
+                }
+                else
+                {
+                    // 若给定速度非类时 (如超光速)，退化取极值
+                    if (std::abs(A) > 1e-10) Ut = -B / (2.0 * A);
+                    else Ut = 1.0;
+                }
+                g_GeoState[7] = Ut;
+                // 4. 重建与之完全正交的相机空间标架 e1, e2, e3
+                glm::vec3 pos(x, y, z);
+                if (glm::length(pos) < 1e-6) pos = glm::vec3(1.0, 0.0, 0.0);
+
+                glm::vec3 m_r = -glm::normalize(pos);
+                glm::vec3 WorldUp = glm::vec3(0.0, 1.0, 0.0);
+                if (std::abs(glm::dot(m_r, WorldUp)) > 0.999f)
+                {
+                    WorldUp = glm::vec3(1.0, 0.0, 0.0);
+                }
+                glm::vec3 m_phi = glm::normalize(glm::cross(WorldUp, m_r));
+                glm::vec3 m_theta = glm::cross(m_phi, m_r);
+                double U_down[4] = { 0, 0, 0, 0 };
+                for (int i = 0; i < 4; ++i)
+                    for (int j = 0; j < 4; ++j)
+                        U_down[i] += g_down[i][j] * g_GeoState[4 + j];
+                auto projectAndNormalize = [&](double* e, double* e_d)
+                {
+                    double dot_e_U = 0.0;
+                    for (int i = 0; i < 4; ++i) dot_e_U += e[i] * U_down[i];
+                    for (int i = 0; i < 4; ++i) e[i] += dot_e_U * g_GeoState[4 + i];
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        e_d[i] = 0.0;
+                        for (int j = 0; j < 4; ++j) e_d[i] += g_down[i][j] * e[j];
+                    }
+                    double norm = 0.0;
+                    for (int i = 0; i < 4; ++i) norm += e[i] * e_d[i];
+                    norm = std::sqrt(std::fmax(1e-9, norm));
+                    for (int i = 0; i < 4; ++i)
+                    {
+                        e[i] /= norm;
+                        e_d[i] /= norm;
+                    }
+                };
+                double e1[4] = { m_r.x, m_r.y, m_r.z, 0.0 };
+                double e1_d[4];
+                projectAndNormalize(e1, e1_d);
+                double e2[4] = { m_theta.x, m_theta.y, m_theta.z, 0.0 };
+                double dot_e2_U = 0.0;
+                for (int i = 0; i < 4; ++i) dot_e2_U += e2[i] * U_down[i];
+                for (int i = 0; i < 4; ++i) e2[i] += dot_e2_U * g_GeoState[4 + i];
+                double dot_e2_e1 = 0.0;
+                for (int i = 0; i < 4; ++i) dot_e2_e1 += e2[i] * e1_d[i];
+                for (int i = 0; i < 4; ++i) e2[i] -= dot_e2_e1 * e1[i];
+                double e2_d[4];
+                projectAndNormalize(e2, e2_d);
+                double e3[4] = { m_phi.x, m_phi.y, m_phi.z, 0.0 };
+                double dot_e3_U = 0.0;
+                for (int i = 0; i < 4; ++i) dot_e3_U += e3[i] * U_down[i];
+                for (int i = 0; i < 4; ++i) e3[i] += dot_e3_U * g_GeoState[4 + i];
+                double dot_e3_e1 = 0.0;
+                for (int i = 0; i < 4; ++i) dot_e3_e1 += e3[i] * e1_d[i];
+                for (int i = 0; i < 4; ++i) e3[i] -= dot_e3_e1 * e1[i];
+                double dot_e3_e2 = 0.0;
+                for (int i = 0; i < 4; ++i) dot_e3_e2 += e3[i] * e2_d[i];
+                for (int i = 0; i < 4; ++i) e3[i] -= dot_e3_e2 * e2[i];
+                double e3_d[4];
+                projectAndNormalize(e3, e3_d);
+                for (int i = 0; i < 4; ++i)
+                {
+                    g_GeoState[8 + i] = m_r.x * e1[i] + m_theta.x * e2[i] + m_phi.x * e3[i];
+                    g_GeoState[12 + i] = m_r.y * e1[i] + m_theta.y * e2[i] + m_phi.y * e3[i];
+                    g_GeoState[16 + i] = m_r.z * e1[i] + m_theta.z * e2[i] + m_phi.z * e3[i];
+                }
+
+                // 5. 使用 Gram-Schmidt 过程进行最后的精细化数值稳定修正
+                GeodesicIntegrator::GramSchmidt(g_GeoState, a, Q, 1.0, g_UniverseSign, g_isOutgoing);
+            }
+        }
+    }
+}
 void FApplication::ExecuteMainRender()
 {    // 初始化 UI 渲染器
     _uiRenderer = std::make_unique<Grt::FVulkanUIRenderer>();
@@ -788,11 +933,11 @@ void FApplication::ExecuteMainRender()
         NpgsCoreError("Failed to initialize UI renderer");
         return;
     }
-   // using namespace Npgs::System::UI::;
+    // using namespace Npgs::System::UI::;
 
-   
 
-    // =========================================================================
+
+     // =========================================================================
     std::unique_ptr<Grt::FColorAttachment> HistoryAttachment;
     // [新增] 预计算阶段的附件
     std::unique_ptr<Grt::FColorAttachment> DistortionAttachment; // 对应 OutDistortionFlag (Set 1, Binding 3)
@@ -1000,9 +1145,9 @@ void FApplication::ExecuteMainRender()
     AssetManager->AddAsset<Art::FTextureCube>(
         "Antiground2", TextureAllocationCreateInfo, "Antiverse2Skybox", vk::Format::eR8G8B8A8Unorm, vk::Format::eR8G8B8A8Unorm,
         vk::ImageCreateFlagBits::eMutableFormat, true, false);
-	AssetManager->AddAsset<Art::FTexture2D>(
-		"RKKV", TextureAllocationCreateInfo, "ButtonMap/rkkv0.png", vk::Format::eR8G8B8A8Unorm,
-		vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
+    AssetManager->AddAsset<Art::FTexture2D>(
+        "RKKV", TextureAllocationCreateInfo, "ButtonMap/rkkv0.png", vk::Format::eR8G8B8A8Unorm,
+        vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
     AssetManager->AddAsset<Art::FTexture2D>(
         "stage0", TextureAllocationCreateInfo, "stage0.png", vk::Format::eR8G8B8A8Unorm,
         vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
@@ -1018,6 +1163,24 @@ void FApplication::ExecuteMainRender()
     AssetManager->AddAsset<Art::FTexture2D>(
         "stage4", TextureAllocationCreateInfo, "stage4.png", vk::Format::eR8G8B8A8Unorm,
         vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
+    // ================= [新增] 动态加载 Disk 文件夹下的所有图片 =================
+    std::string diskPath = "Assets/Textures/Disk";
+    if (std::filesystem::exists(diskPath))
+    {
+        for (const auto& entry : std::filesystem::directory_iterator(diskPath))
+        {
+            if (entry.path().extension() == ".png" || entry.path().extension() == ".jpg")
+            {
+                std::string filename = entry.path().filename().string();
+                std::string texName = "DiskTex_" + filename;
+                AssetManager->AddAsset<Art::FTexture2D>(
+                    texName, TextureAllocationCreateInfo, "Disk/" + filename, vk::Format::eR8G8B8A8Unorm,
+                    vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
+                g_DiskTextures.push_back(texName);
+            }
+        }
+    }
+    // =========================================================================
     AssetManager->AddAsset<Art::FTexture2D>(
         "NPGSTexture", TextureAllocationCreateInfo, "nw.png", vk::Format::eR8G8B8A8Unorm,
         vk::Format::eR8G8B8A8Unorm, vk::ImageCreateFlags(), false, false);
@@ -1059,8 +1222,8 @@ void FApplication::ExecuteMainRender()
                     "iCamDataCoordisOutgoing","DEBUG","Prepass","Whitehole","InWhichUniverse","Grid","EnableHeatHaze","EnableShadowCulling", "ObserverMode","Polarization","iUseImageDisk",
                     "Quality","UniverseSign",
                      "BlackHoleTime","BlackHoleMassSol", "Spin","Q", "Mu", "AccretionRate","BackShiftMax","DensestarsurfaceR","DensestarBlackbodyIntensityExponent","DensestarRedShiftColorExponent","DensestarRedShiftIntensityExponent","DensestarBrightmut","InterRadiusRs", "OuterRadiusRs","ThinRs","Hopper", "Brightmut","Darkmut","Reddening","Saturation"
-                     , "BlackbodyIntensityExponent","RedShiftColorExponent","RedShiftIntensityExponent","PolarizationAngle","HeatHaze","BackgroundBrightmut","PhotonRingBoost","PhotonRingColorTempBoost","BoostRot","JetRedShiftIntensityExponent","JetBrightmut","JetSaturation","JetShiftMax","BlendWeight"},
-        .Set = 0,                                                                                          
+                     , "BlackbodyIntensityExponent","RedShiftColorExponent","RedShiftIntensityExponent","ImageRotationSpeed","PolarizationAngle","HeatHaze","BackgroundBrightmut","PhotonRingBoost","PhotonRingColorTempBoost","BoostRot","JetRedShiftIntensityExponent","JetBrightmut","JetSaturation","JetShiftMax","BlendWeight"},
+        .Set = 0,
         .Binding = 1,
         .Usage = vk::DescriptorType::eUniformBuffer
     };
@@ -1074,8 +1237,8 @@ void FApplication::ExecuteMainRender()
     // ------------------------
     vk::SamplerCreateInfo SamplerCreateInfo = Art::FTextureBase::CreateDefaultSamplerCreateInfo();
     std::vector<vk::DescriptorImageInfo> ImageInfos;
-
     Grt::FVulkanSampler Sampler(SamplerCreateInfo);
+    g_GlobalSampler = &Sampler;
 
     SamplerCreateInfo
         .setMagFilter(vk::Filter::eLinear)
@@ -1246,17 +1409,17 @@ void FApplication::ExecuteMainRender()
         *FramebufferSampler,
         *stage1->GetImageView(),
         vk::ImageLayout::eShaderReadOnlyOptimal
-    );    
+    );
     stage2ID = _uiRenderer->AddTexture(
         *FramebufferSampler,
         *stage2->GetImageView(),
         vk::ImageLayout::eShaderReadOnlyOptimal
-    );    
+    );
     stage3ID = _uiRenderer->AddTexture(
         *FramebufferSampler,
         *stage3->GetImageView(),
         vk::ImageLayout::eShaderReadOnlyOptimal
-    );    
+    );
     stage4ID = _uiRenderer->AddTexture(
         *FramebufferSampler,
         *stage4->GetImageView(),
@@ -1465,16 +1628,16 @@ void FApplication::ExecuteMainRender()
                 float Q;
             };
             std::vector<PhysicsConfig> physicsConfigs = {
-               // {-0.2f, 0.0f},
-               // {-0.5f, 0.0f},
-               // {-0.8f, 0.0f},
-              //  {-1.0f, 0.0f},
-              //  {-0.7f, 0.7f},
-                {0.2f, 0.0f},
-                {0.5f, 0.0f},
-                {0.8f, 0.0f},
-                {1.0f, 0.0f},
-                {0.7f, 0.7f}
+                //{-0.2f, 0.0f},
+                //{-0.5f, 0.0f},
+                //{-0.8f, 0.0f},
+                //{-1.0f, 0.0f},
+                //{-0.7f, 0.7f},
+                //{0.2f, 0.0f},
+                //{0.5f, 0.0f},
+                {0.8f, 0.0f}
+                //{1.0f, 0.0f},
+                //{0.7f, 0.7f}
             };
             struct DiskShapeConfig
             {
@@ -1482,11 +1645,11 @@ void FApplication::ExecuteMainRender()
                 float ThinRs;
             };
             std::vector<DiskShapeConfig> diskConfigs = {
-                {0.0f, 2.0f},
-                {0.0f, 0.5f},
-                {0.0f, 0.75f},
-                {0.0f, 25.0f},
-                {0.5f, 0.0f}
+                //{0.0f, 2.0f},
+                //{0.0f, 0.5f},
+                {0.0f, 2.0f}
+                //{0.0f, 25.0f},
+                //{0.5f, 0.0f}
             };
             // ================= 批量截图任务列表 =================
             struct ScreenshotTask
@@ -1498,14 +1661,14 @@ void FApplication::ExecuteMainRender()
                 std::string NameSuffix;
             };
             std::vector<ScreenshotTask> captureTasks = {
-                {0, 15.0f, 0, 0.01f, "Univ0_FOV15_Grid0_Phi0.01"},
-                {0, 15.0f, 0, 17.0f, "Univ0_FOV15_Grid0_Phi17"},
-                {0, 15.0f, 0, 45.0f, "Univ0_FOV15_Grid0_Phi45"},
-                {0, 15.0f, 0, 15.0f, "Univ0_FOV15_Grid0_Phi15"},
-                {1, 15.0f, 0, 0.01f, "Univ1_FOV15_Grid0_Phi0.01"},
-                {1, 15.0f, 0, 17.0f, "Univ1_FOV15_Grid0_Phi17"},
-                {1, 15.0f, 0, 45.0f, "Univ1_FOV15_Grid0_Phi45"},
-                {1, 15.0f, 0, 15.0f, "Univ1_FOV15_Grid0_Phi15"},
+                //{0, 15.0f, 0, 0.01f, "Univ0_FOV15_Grid0_Phi0.01"},
+                //{0, 15.0f, 0, 17.0f, "Univ0_FOV15_Grid0_Phi17"},
+                //{0, 15.0f, 0, 45.0f, "Univ0_FOV15_Grid0_Phi45"},
+                //{0, 15.0f, 0, 15.0f, "Univ0_FOV15_Grid0_Phi15"},
+                //{1, 15.0f, 0, 0.01f, "Univ1_FOV15_Grid0_Phi0.01"},
+                //{1, 15.0f, 0, 15.0f, "Univ1_FOV15_Grid0_Phi15"},
+                {1, 10.0f, 0, 45.0f, "Univ1_FOV10_Grid0_Phi45"}
+                //{1, 15.0f, 0, 80.0f, "Univ1_FOV15_Grid0_Phi80"},
             };
 
             // 获取时间前缀并创建目录
@@ -1547,7 +1710,7 @@ void FApplication::ExecuteMainRender()
                     }
 
                     // 设置吸积盘内边界为 ISCO 和 (视界+0.1) 中的较大值
-                    BlackHoleArgs.InterRadiusRs = std::max((float)isco_Rs, (float)outer_horizon_Rs + 0.1f);
+                    BlackHoleArgs.InterRadiusRs = std::fmax((float)isco_Rs, (float)outer_horizon_Rs + 0.1f);
 
                     // 打印日志，方便调试
                     std::cout << "  [Param Update] a*=" << a_star << ", Q*=" << q_star
@@ -1860,14 +2023,18 @@ void FApplication::ExecuteMainRender()
         // =========================================================================
         // [修改] 游戏主循环中的 UI 处理
         // =========================================================================
-        ui_ctx.SetInputBlocked(_bIsDraggingInWorld);
+        ui_ctx.SetInputBlocked(_bIsDraggingInWorld || g_bHideUIAndMouse);
         m_screen_manager->Update(_DeltaTime);
         m_screen_manager->ApplyPendingChanges();
-        m_screen_manager->Draw();
-        // =========================================================================
 
-        // Render other standard ImGui windows
-        RenderDebugUI();
+        // 只有在未隐藏 UI 的情况下才执行绘制
+        if (!g_bHideUIAndMouse)
+        {
+            m_screen_manager->Draw();
+            // Render other standard ImGui windows
+            RenderDebugUI();
+        }
+        // =========================================================================
 
         _uiRenderer->EndFrame();
         // Uniform update
@@ -1898,25 +2065,28 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.CameraVelocity = glm::vec4(0.0f, 0.0f, 0.0f, 0.0f);
 
                 BlackHoleArgs.DEBUG = 0;
-                BlackHoleArgs.Prepass = 0;
-				BlackHoleArgs.Whitehole = 0;
-				BlackHoleArgs.InWhichUniverse = 0;
+                BlackHoleArgs.Prepass = 1;
+                //BlackHoleArgs.Prepass = 0;
+                BlackHoleArgs.Whitehole = 0;
+                //BlackHoleArgs.Whitehole = 1;
+                BlackHoleArgs.InWhichUniverse = 0;
                 BlackHoleArgs.Grid = 0;
-				BlackHoleArgs.EnableHeatHaze = 0;
-				BlackHoleArgs.EnableShadowCulling = 0;
+                BlackHoleArgs.EnableHeatHaze = 0;
+                BlackHoleArgs.EnableShadowCulling = 0;
                 BlackHoleArgs.ObserverMode = 0;
-                BlackHoleArgs.Polarization = 0.0;
+                BlackHoleArgs.Polarization = 0;
                 BlackHoleArgs.UseImageDisk = 0;
 
                 BlackHoleArgs.Quality = 1.0;
                 BlackHoleArgs.UniverseSign = 1.0;
+                //BlackHoleArgs.UniverseSign = -1.0;
                 BlackHoleArgs.BlackHoleTime = GameTime * kSpeedOfLight / Rs / kLightYearToMeter;
                 BlackHoleArgs.BlackHoleMassSol = 1.49e7f;
-                BlackHoleArgs.Spin = 0.95f;
+                BlackHoleArgs.Spin = 0.998f;
                 BlackHoleArgs.Q = 0.0f;
                 BlackHoleArgs.Mu = 1.0f;
-                BlackHoleArgs.AccretionRate = (2e-4);
-				BlackHoleArgs.BackShiftMax = 1.5f;
+                BlackHoleArgs.AccretionRate = (1e-2);
+                BlackHoleArgs.BackShiftMax = 1.5f;
 
                 BlackHoleArgs.DensestarsurfaceR = 0.0;
                 BlackHoleArgs.DensestarBlackbodyIntensityExponent = 4.0;
@@ -1925,23 +2095,29 @@ void FApplication::ExecuteMainRender()
                 BlackHoleArgs.DensestarBrightmut = 1.0;
 
 
-                BlackHoleArgs.InterRadiusRs = 0.5;
-                BlackHoleArgs.OuterRadiusRs = 0.0;
-                BlackHoleArgs.ThinRs = 0.1;
-                BlackHoleArgs.Hopper = 0.0;
+                BlackHoleArgs.InterRadiusRs = 2.0;
+                BlackHoleArgs.OuterRadiusRs = 65.0;
+                BlackHoleArgs.ThinRs = 0.75;
+                BlackHoleArgs.Hopper = 0.4;
                 BlackHoleArgs.Brightmut = 1.0;
                 BlackHoleArgs.Darkmut = 0.5;
                 BlackHoleArgs.Reddening = 0.3;
                 BlackHoleArgs.Saturation = 0.5;
+                //BlackHoleArgs.Darkmut = 0.0;
+                //BlackHoleArgs.Reddening = 0.0;
+                //BlackHoleArgs.Saturation = 0.0;
                 BlackHoleArgs.BlackbodyIntensityExponent = 0.5;
+                //BlackHoleArgs.BlackbodyIntensityExponent = 4.0;
                 BlackHoleArgs.RedShiftColorExponent = 1.0;
                 BlackHoleArgs.RedShiftIntensityExponent = 4.0;
+                BlackHoleArgs.ImageRotationSpeed = 0.00765619656 * (3.06 / 3.0);
                 BlackHoleArgs.PolarizationAngle = 0.0;
-				BlackHoleArgs.HeatHaze = 0.0;
-				BlackHoleArgs.BackgroundBrightmut = 0.8;
-				BlackHoleArgs.PhotonRingBoost = 0.0;
-				BlackHoleArgs.PhotonRingColorTempBoost = 0.0;
-				BlackHoleArgs.BoostRot = 0.0;
+                BlackHoleArgs.HeatHaze = 0.0;
+                BlackHoleArgs.BackgroundBrightmut = 0.5;
+                //BlackHoleArgs.BackgroundBrightmut = 0.0;
+                BlackHoleArgs.PhotonRingBoost = 0.0;
+                BlackHoleArgs.PhotonRingColorTempBoost = 0.0;
+                BlackHoleArgs.BoostRot = 0.0;
                 BlackHoleArgs.JetRedShiftIntensityExponent = 4.0;
                 BlackHoleArgs.JetBrightmut = 1.0;
                 BlackHoleArgs.JetSaturation = 0.0;
@@ -2023,15 +2199,15 @@ void FApplication::ExecuteMainRender()
                 // 平滑过渡
                 BlackHoleArgs.CameraVelocity += float(1.0 - exp(-_DeltaTime / 0.1)) * (glm::vec4(currentDimVelocity, 0.0f) - BlackHoleArgs.CameraVelocity);
                 if (glm::any(glm::isnan(BlackHoleArgs.CameraVelocity)) || glm::any(glm::isinf(BlackHoleArgs.CameraVelocity)))
-				{
-					BlackHoleArgs.CameraVelocity = glm::vec4(0.0f);
-				}
+                {
+                    BlackHoleArgs.CameraVelocity = glm::vec4(0.0f);
+                }
             }
 
             Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
-            BlackHoleArgs.BlendWeight = (1.0 - pow(0.5, (_DeltaTime) / std::max(std::min((0.131 * 36.0 / (GameArgs.TimeRate) * (Rs / 0.00000465)), 0.5), 0.06)));
+            BlackHoleArgs.BlendWeight = (1.0 - pow(0.5, (_DeltaTime) / std::fmax(std::min((0.131 * 36.0 / (GameArgs.TimeRate) * (Rs / 0.00000465)), 0.5), 0.06)));
             if (!(abs(glm::quat((lastdir - BlackHoleArgs.InverseCamRot)).w - 0.5) < 0.001 * _DeltaTime || abs(glm::quat((lastdir - BlackHoleArgs.InverseCamRot)).w - 0.0) < 0.001 * _DeltaTime) ||
-                glm::length(glm::vec3(LastBlackHoleRelativePos - BlackHoleArgs.BlackHoleRelativePosRs)) > (glm::length(glm::vec3(LastBlackHoleRelativePos)) - 1.0) * 0.006 * _DeltaTime  || glm::length(BlackHoleArgs.CameraVelocity)>0.0001)
+                glm::length(glm::vec3(LastBlackHoleRelativePos - BlackHoleArgs.BlackHoleRelativePosRs)) > (glm::length(glm::vec3(LastBlackHoleRelativePos)) - 1.0) * 0.006 * _DeltaTime || glm::length(BlackHoleArgs.CameraVelocity) > 0.0001)
             {
                 BlackHoleArgs.BlendWeight = 1.0f;
             }
@@ -2059,13 +2235,13 @@ void FApplication::ExecuteMainRender()
                     double abs_a = std::abs(BlackHoleArgs.Spin * 0.5); // M = 0.5，物理自旋 a = Spin * M
                     double rho = std::sqrt(g_GeoState[0] * g_GeoState[0] + g_GeoState[2] * g_GeoState[2]);
                     double r_sq = (rho - abs_a) * (rho - abs_a) + g_GeoState[1] * g_GeoState[1];
-                    double R = std::sqrt(std::max(1e-12, r_sq));
+                    double R = std::sqrt(std::fmax(1e-12, r_sq));
 
-                    double scaled_R = std::max(R / 2.0, 1.0);
+                    double scaled_R = std::fmax(R / 2.0, 1.0);
                     double max_dtau_gravity = 0.005 * scaled_R * std::sqrt(scaled_R);
 
                     double U_spatial_mag = std::sqrt(g_GeoState[4] * g_GeoState[4] + g_GeoState[5] * g_GeoState[5] + g_GeoState[6] * g_GeoState[6]);
-                    double max_dtau_kinematic = (0.05 * R) / std::max(1e-6, U_spatial_mag);
+                    double max_dtau_kinematic = (0.05 * R) / std::fmax(1e-6, U_spatial_mag);
 
                     double safe_dtau = std::min(max_dtau_gravity, max_dtau_kinematic);
                     safe_dtau = std::clamp(safe_dtau, 0.0005, 5.0);
@@ -2074,7 +2250,7 @@ void FApplication::ExecuteMainRender()
 
                     // 执行单步积分
                     GeodesicIntegrator::StepRK4(current_step * dtau_sign, BlackHoleArgs.Spin * 0.5, BlackHoleArgs.Q * 0.5);
-
+                    GeodesicIntegrator::g_ProperTime += (current_step * dtau_sign);
                     dtau_remaining -= current_step;
                     step_count++;
                 }
@@ -2118,7 +2294,7 @@ void FApplication::ExecuteMainRender()
 
             // ==================== [修改] 获取最新计算出的坐标后再进行穿越与宇宙判断 ====================
             glm::vec3 pos;
-             Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
+            Rs = 2.0 * abs(BlackHoleArgs.BlackHoleMassSol) * kGravityConstant / pow(kSpeedOfLight, 2) * kSolarMass / kLightYearToMeter;
 
             if (g_GeodesicMode)
             {
@@ -2211,7 +2387,7 @@ void FApplication::ExecuteMainRender()
             _VulkanContext->SwapImage(*Semaphores_ImageAvailable[CurrentFrame]);
             std::uint32_t ImageIndex = _VulkanContext->GetCurrentImageIndex();
 
-           // BlendAttachmentInfo.setImageView(_VulkanContext->GetSwapchainImageView(ImageIndex));
+            // BlendAttachmentInfo.setImageView(_VulkanContext->GetSwapchainImageView(ImageIndex));
 
             std::uint32_t WorkgroundX = (_WindowSize.width + 9) / 10;
             std::uint32_t WorkgroundY = (_WindowSize.height + 9) / 10;
@@ -2798,6 +2974,35 @@ void FApplication::ExecuteMainRender()
 
         ProcessInput();
         update();
+        // ================= [新增] 处理图片吸积盘的描述符更新 =================
+        if (g_DiskStateChanged && g_GlobalSampler)
+        {
+            g_DiskStateChanged = false;
+            auto* AssetManager = Art::FAssetManager::GetInstance();
+            auto* PrepassShader = AssetManager->GetAsset<Art::FShader>("BlackHolePrepass");
+            auto* CompositeShader = AssetManager->GetAsset<Art::FShader>("BlackHoleComposite");
+
+            Art::FTexture2D* Tex = nullptr;
+            if (g_CurrentDiskState == -1)
+            {
+                Tex = AssetManager->GetAsset<Art::FTexture2D>("NPGSTexture"); // 默认的替位图
+            }
+            else
+            {
+                Tex = AssetManager->GetAsset<Art::FTexture2D>(g_DiskTextures[g_CurrentDiskState]);
+            }
+
+            if (Tex && PrepassShader && CompositeShader)
+            {
+                std::vector<vk::DescriptorImageInfo> UpdateImageInfos;
+                UpdateImageInfos.push_back(Tex->CreateDescriptorImageInfo(*g_GlobalSampler));
+
+                // 将最新选择的图片更新到 Binding 9 中
+                PrepassShader->WriteSharedDescriptors(1, 9, vk::DescriptorType::eCombinedImageSampler, UpdateImageInfos);
+                CompositeShader->WriteSharedDescriptors(1, 9, vk::DescriptorType::eCombinedImageSampler, UpdateImageInfos);
+            }
+        }
+        // =====================================================================
     }
 
     _VulkanContext->WaitIdle();
@@ -2826,23 +3031,23 @@ bool FApplication::InitializeWindow()
     };
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     // 注意：全屏模式下透明缓冲通常无效或会导致兼容性问题，根据需求保留
-    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, true); 
+    glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, true);
     GLFWmonitor* PrimaryMonitor = nullptr;
-    
+
     if (_bEnableFullscreen)
     {
         // 获取主显示器
         PrimaryMonitor = glfwGetPrimaryMonitor();
-        
+
 
         const GLFWvidmode* mode = glfwGetVideoMode(PrimaryMonitor);
         _WindowSize.width = mode->width;
         _WindowSize.height = mode->height;
-        
+
     }
     // 将 PrimaryMonitor 传给第四个参数
     _Window = glfwCreateWindow(_WindowSize.width, _WindowSize.height, _WindowTitle.c_str(), PrimaryMonitor, nullptr);
-    
+
     if (_Window == nullptr)
     {
         NpgsCoreError("Failed to create GLFW window.");
@@ -3086,7 +3291,7 @@ void FApplication::ProcessInput()
             _bIsDraggingInWorld = false;
 
             // 仅当右键没有在拖动时才恢复鼠标显示，防止左右键冲突
-            if (!_bIsDraggingRightInWorld)
+            if (!_bIsDraggingRightInWorld && !g_bHideUIAndMouse)
             {
                 glfwSetInputMode(_Window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
             }
@@ -3156,7 +3361,7 @@ void FApplication::ProcessInput()
             _bIsDraggingRightInWorld = false;
 
             // 仅当左键没有在拖动时才恢复鼠标显示
-            if (!_bIsDraggingInWorld)
+            if (!_bIsDraggingInWorld && !g_bHideUIAndMouse)
             {
                 glfwSetInputMode(_Window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
             }
@@ -3203,7 +3408,7 @@ void FApplication::ProcessInput()
     // 6. 处理滚轮缩放 / 推力控制 (消费 Buffer)
     // -----------------------------------------------------------
     // [新增] 用于持久化存储测地模式下的推力大小，初始设为 1.5
-    
+
 
     if (_buffered_scroll_y != 0.0f)
     {
@@ -3233,7 +3438,7 @@ void FApplication::ProcessInput()
         // 模式切换
         static bool wasTDown = false;
         bool isTDown = glfwGetKey(_Window, GLFW_KEY_T) == GLFW_PRESS;
-        if (isTDown && !wasTDown&&!g_GeodesicMode)
+        if (isTDown && !wasTDown && !g_GeodesicMode)
         {
             _FreeCamera->ProcessModeChange();
         }
@@ -3256,16 +3461,58 @@ void FApplication::ProcessInput()
                 glm::vec3 pos = _FreeCamera->GetCameraVector(SysSpa::FCamera::EVectorType::kPosition) / Rs;
 
                 // 获取相机此刻的物理三维坐标速度 (v/c)
-                glm::vec3 vel = glm::vec3(BlackHoleArgs.CameraVelocity);
+                glm::vec3 velo = glm::vec3(BlackHoleArgs.CameraVelocity);
 
                 g_isOutgoing = false; // 初始为 Ingoing
                 g_UniverseSign = BlackHoleArgs.UniverseSign;
-
+                GeodesicIntegrator::g_ProperTime = 0.0;
                 // 将位置和速度一起传入测地线积分器
-                GeodesicIntegrator::InitializeGeodesicState(pos, vel, BlackHoleArgs.Spin * 0.5, BlackHoleArgs.Q * 0.5);
+                GeodesicIntegrator::InitializeGeodesicState(pos, velo, BlackHoleArgs.Spin * 0.5, BlackHoleArgs.Q * 0.5);
             }
         }
         wasGDown = isGDown;
+        // ================= [新增] 图片切换循环逻辑 (按下 'o' 键) =================
+        static bool wasODown = false;
+        bool isODown = glfwGetKey(_Window, GLFW_KEY_O) == GLFW_PRESS;
+        if (isODown && !wasODown)
+        {
+            if (!g_DiskTextures.empty())
+            {
+                // 第一次按下时记录体积盘原状态
+                if (g_CurrentDiskState == -1)
+                {
+                    g_OriginalThinRs = BlackHoleArgs.ThinRs;
+                    g_OriginalHopper = BlackHoleArgs.Hopper;
+                }
+                g_CurrentDiskState++;
+
+                // 循环到底后恢复体积盘状态
+                if (g_CurrentDiskState >= g_DiskTextures.size())
+                {
+                    g_CurrentDiskState = -1;
+                    BlackHoleArgs.ThinRs = g_OriginalThinRs;
+                    BlackHoleArgs.Hopper = g_OriginalHopper;
+                    BlackHoleArgs.UseImageDisk = 0;
+                    BlackHoleArgs.Prepass = 1;
+                    g_DiskStateChanged = true;
+                }
+                else
+                {
+                    // 隐藏体积盘开启图片盘
+                    BlackHoleArgs.ThinRs = 0.0f;
+                    BlackHoleArgs.Hopper = 0.0f;
+                    BlackHoleArgs.UseImageDisk = 1;
+                    BlackHoleArgs.Prepass = 0;
+                    g_DiskStateChanged = true;
+                }
+            }
+            else
+            {
+                std::cout << "[Warning] Assets/Textures/Disk 文件夹下没有找到图片!" << std::endl;
+            }
+        }
+        wasODown = isODown;
+        // =========================================================================
 
         static bool wasPDown = false;
         bool isPDown = glfwGetKey(_Window, GLFW_KEY_P) == GLFW_PRESS;
@@ -3275,6 +3522,21 @@ void FApplication::ProcessInput()
             DumpArgsToJson(filename);
         }
         wasPDown = isPDown;
+        static bool wasHDown = false;
+        bool isHDown = glfwGetKey(_Window, GLFW_KEY_H) == GLFW_PRESS;
+        if (isHDown && !wasHDown)
+        {
+            g_bHideUIAndMouse = !g_bHideUIAndMouse;
+            if (g_bHideUIAndMouse)
+            {
+                glfwSetInputMode(_Window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
+            }
+            else if (!_bIsDraggingInWorld && !_bIsDraggingRightInWorld)
+            {
+                glfwSetInputMode(_Window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+            }
+        }
+        wasHDown = isHDown;
 
         static bool wasCtrlAltSDown = false;
         bool isCtrlDown = glfwGetKey(_Window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || glfwGetKey(_Window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS;
@@ -3448,18 +3710,31 @@ void FApplication::HandleScroll(double OffsetX, double OffsetY)
 // =========================================================================
 // [新增] 轨迹记录数据结构 (基于长度保留)
 // =========================================================================
+// =========================================================================
+// [修改] 轨迹记录数据结构 (增加时间与坐标系状态)
+// =========================================================================
+// =========================================================================
+// [修改] 轨迹记录数据结构 (增加宇宙索引)
+// =========================================================================
 struct FTrajectoryPoint
 {
     glm::vec3 Pos;
     float UniverseSign;
-    float Odometer; // 该点录入时的历史总里程
+    float Odometer;
+    double t_ks;
+    bool isOut;
+    int UnivIndex;  // [新增] 记录录入时的宇宙层级索引
 };
 static std::deque<FTrajectoryPoint> g_TrajectoryHistory;
-static float g_TotalOdometer = 0.0f; // 全局总里程表
+static float g_TotalOdometer = 0.0f;
 
 void FApplication::RenderDebugUI()
 {
-    // 如果你已经有全局的 ImGui::Begin()，请确保这里的名字不冲突
+    double M_PI = 3.14159265358979323846;
+    // ==========================================
+// [新增] Kerr-Schild 到 Penrose 图的严格映射工具
+// ==========================================
+   // 如果你已经有全局的 ImGui::Begin()，请确保这里的名字不冲突
     ImGui::Begin("Black Hole Topology Map", nullptr, ImGuiWindowFlags_NoScrollbar);
 
     // 1. 获取基础物理参数与坐标 (按 Rs 归一化)
@@ -3495,7 +3770,7 @@ void FApplication::RenderDebugUI()
         // ========================================================
         // [完美修正] 计算相对于全局静态观者 (Static Observer) 的物理速度
         // ========================================================
-        double g_down[4][4], g_up[4][4], dummy_r;
+        double g_down[4][4] = { 0.0 }, g_up[4][4] = {0.0}, dummy_r;
         GeodesicIntegrator::ComputeMetric(g_GeoState, a, Q, 1.0, BlackHoleArgs.UniverseSign, g_isOutgoing, g_down, g_up, dummy_r);
 
         // 计算协变时间分量 U_t (物理意义为静态观者测量的能量 E = -U_t)。
@@ -3510,7 +3785,7 @@ void FApplication::RenderDebugUI()
         double g_tt = g_down[3][3];
 
         // 防止除零 (当粒子能量趋于 0 时)
-        double U_t_sq = std::max(1e-12, U_t * U_t);
+        double U_t_sq = std::fmax(1e-12, U_t * U_t);
 
         // 相对静态观者的速度公式推导：
         // 洛伦兹因子 gamma = -U_t / sqrt(|g_tt|) 
@@ -3523,7 +3798,7 @@ void FApplication::RenderDebugUI()
         double v_sq = 1.0 + (g_tt / U_t_sq);
 
         // max(0, v_sq) 防止在正常空间因极端浮点误差产生微小的负值
-        physical_speed = static_cast<float>(std::sqrt(std::max(0.0, v_sq)));
+        physical_speed = static_cast<float>(std::sqrt(std::fmax(0.0, v_sq)));
     }
     else
     {
@@ -3535,17 +3810,151 @@ void FApplication::RenderDebugUI()
         physical_speed = glm::length(camVel);
     }
     // ==========================================
-// [新增] UI 数据面板 (数值坐标与加速度面板)
-// ==========================================
-// 计算 BL 半径 r (用于显示)
+    // [新增] UI 数据面板 (数值坐标与加速度面板)
+    // ==========================================
+    // 计算 BL 半径 r (用于显示)
     float r_ui_b = (camPos.x * camPos.x + camPos.y * camPos.y + camPos.z * camPos.z) - a2;
     float r_ui_c = a2 * camPos.y * camPos.y;
     float r_ui2 = 0.5f * (r_ui_b + std::sqrt(r_ui_b * r_ui_b + 4.0f * r_ui_c));
-    float r_ui = std::sqrt(std::max(0.0f, r_ui2)) * BlackHoleArgs.UniverseSign;
+    float r_ui = std::sqrt(std::fmax(0.0f, r_ui2)) * BlackHoleArgs.UniverseSign;
+
+    // ==========================================
+    // [新增] 计算真正的 Boyer-Lindquist 无穷远时钟时 t_BL
+    // ==========================================
+    double t_BL = BlackHoleArgs.BlackHoleTime; // 默认漫游模式直接使用
+    if (g_GeodesicMode)
+    {
+        double Delta = r_ui * r_ui - 2.0 * M * r_ui + a2 + Q2;
+        double abs_Delta_safe = std::fmax(std::abs(Delta), 1e-16);
+        double delta_disc = M * M - a2 - Q2;
+
+        double F_r = 0.0; // F_r = 2 * \int (2Mr - Q^2)/Delta dr
+        if (delta_disc > 1e-16)
+        {
+            double K = std::sqrt(delta_disc);
+            double frac = std::abs(r_ui - (M + K)) / std::fmax(std::abs(r_ui - (M - K)), 1e-16);
+            F_r = 2.0 * M * std::log(abs_Delta_safe) + ((2.0 * M * M - Q2) / K) * std::log(std::fmax(frac, 1e-16));
+        }
+        else if (delta_disc < -1e-16)
+        {
+            double K = std::sqrt(-delta_disc);
+            double atan_arg = std::atan((r_ui - M) / K);
+            F_r = 2.0 * M * std::log(abs_Delta_safe) + (2.0 * (2.0 * M * M - Q2) / K) * atan_arg;
+        }
+        else // 极端黑洞
+        {
+            double rM = r_ui - M;
+            double safe_rM = (rM >= 0 ? 1.0 : -1.0) * std::fmax(std::abs(rM), 1e-16);
+            F_r = 4.0 * M * std::log(std::fmax(std::abs(rM), 1e-16)) - 2.0 * (2.0 * M * M - Q2) / safe_rM;
+        }
+
+        // KS 时 \tilde{t} 与 BL 时 t 的关系：
+        // Ingoing KS:  t = \tilde{t} - 0.5 * F_r
+        // Outgoing KS: t = \tilde{t} + 0.5 * F_r
+        double dir = g_isOutgoing ? 1.0 : -1.0;
+        t_BL = g_GeoState[3] + dir * 0.5 * F_r;
+    }
+
+    // ==========================================
+// [新增] 计算真正的 Boyer-Lindquist 无穷远时钟时 t_BL
+// ==========================================
+// ... (你原来的 t_BL 计算代码保持不变) ...
 
     ImGui::Text("--- Coordinates & Physics ---");
+    // ========================================================
+    // [新增] 4-向量与坐标系状态显示 (仅在物理测地线模式下有意义)
+    // ========================================================
+    if (g_GeodesicMode)
+    {
+        // 1. 判断并高亮显示当前处于哪个坐标系 (Chart)
+        const char* chartName = g_isOutgoing ? "Outgoing Kerr-Schild (White Hole/Escape)"
+            : "Ingoing Kerr-Schild (Black Hole/Fall)";
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "[Chart]: %s", chartName);
+        // 2. 显示 4-坐标 X^\mu = (t, x, y, z)
+        ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.8f, 1.0f), "4-Position X^mu (t, x, y, z):");
+        ImGui::Text("  %.5f,  %.4f, %.4f, %.4f",
+            g_GeoState[3], g_GeoState[0], g_GeoState[1], g_GeoState[2]);
+        // 3. 显示 4-速度 U^\mu = (U^t, U^x, U^y, U^z)
+        ImGui::TextColored(ImVec4(0.8f, 0.5f, 1.0f, 1.0f), "4-Velocity U^mu (U^t, U^x, U^y, U^z):");
+        ImGui::Text("  %.5f,  %.5f, %.5f, %.5f",
+            g_GeoState[7], g_GeoState[4], g_GeoState[5], g_GeoState[6]);
+
+        ImGui::Separator();
+    }
+    ImGui::Text("t (BL): %.5f Rs/c", t_BL);
+
+    // ========================================================
+    // [新增] 坐标时与固有时的差值 (t - tau) 滚动数据曲线
+    // ========================================================
+    if (g_GeodesicMode)
+    {
+        // 【注意】请将下面的 GameArgs.ProperTime 替换为你引擎中实际记录“固有时间”的变量
+        // 通常在测地线积分器中会有一个累加的 tau (或 affine parameter)
+        double tau = GeodesicIntegrator::g_ProperTime; // <--- 修改为你的实际变量名
+        float time_dilation_diff = static_cast<float>(t_BL - tau);
+
+        // 静态变量用于维护图表的环形缓冲区 (Task Manager style)
+        const int GRAPH_SAMPLES = 200;  // 采样点数量
+        static float s_TimeDiffHistory[GRAPH_SAMPLES] = { 0 };
+        static int s_HistoryOffset = 0;
+        static double s_LastGraphUpdateTime = 0;
+        static bool s_IsFirstFrame = true;
+
+        // 初始化：防止第一帧时因为默认0导致图表Y轴缩放极其夸张
+        if (s_IsFirstFrame)
+        {
+            for (int i = 0; i < GRAPH_SAMPLES; ++i)
+                s_TimeDiffHistory[i] = time_dilation_diff;
+            s_IsFirstFrame = false;
+        }
+
+        // 控制采样刷新率 (例如每秒 60 次采样，避免图表滚动过快)
+        double currentTime = ImGui::GetTime();
+        if (currentTime - s_LastGraphUpdateTime > (1.0 / 60.0))
+        {
+            s_TimeDiffHistory[s_HistoryOffset] = time_dilation_diff;
+            s_HistoryOffset = (s_HistoryOffset + 1) % GRAPH_SAMPLES;
+            s_LastGraphUpdateTime = currentTime;
+        }
+
+        // 动态计算 Y 轴的 Min 和 Max 以实现任务管理器的自适应缩放效果
+        float min_val = FLT_MAX;
+        float max_val = -FLT_MAX;
+        for (int i = 0; i < GRAPH_SAMPLES; ++i)
+        {
+            if (s_TimeDiffHistory[i] < min_val) min_val = s_TimeDiffHistory[i];
+            if (s_TimeDiffHistory[i] > max_val) max_val = s_TimeDiffHistory[i];
+        }
+        // 给图表上下增加一点点 padding 留白，防止直线贴在边缘
+        float padding = (max_val - min_val) * 0.1f;
+        if (padding < 1e-4f) padding = 0.1f; // 防除零
+
+        // 绘制图表
+        char overlay_text[64];
+        snprintf(overlay_text, sizeof(overlay_text), "t - tau: %.4f", time_dilation_diff);
+
+        // Push 颜色让图表更有科幻感（可选）
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.1f, 0.15f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_PlotLines, ImVec4(0.0f, 0.8f, 1.0f, 1.0f));
+
+        ImGui::PlotLines("##TimeDilationGraph",
+            s_TimeDiffHistory,
+            GRAPH_SAMPLES,
+            s_HistoryOffset,
+            overlay_text,
+            min_val - padding,
+            max_val + padding,
+            ImVec2(ImGui::GetContentRegionAvail().x, 60.0f)); // 高度为60
+
+        ImGui::PopStyleColor(2);
+
+        ImGui::Text("Proper Time (tau): %.5f", tau);
+    }
+    // ========================================================
+
     ImGui::Text("r (BL): %.5f Rs", r_ui);
     ImGui::Text("x: %.4f | y: %.4f | z: %.4f (Rs)", camPos.x, camPos.y, camPos.z);
+    // ... 下面接原有的代码 ...
     ImGui::Text("Spin (a*): %.4f | Charge (Q*): %.4f", BlackHoleArgs.Spin, BlackHoleArgs.Q);
     ImGui::Text("Velocity: %.6f c", physical_speed);
 
@@ -3573,7 +3982,7 @@ void FApplication::RenderDebugUI()
             double tau_phys_sec = dtau_code * (Rs_meters / kSpeedOfLight);
 
             // 计算玩家在当前倍率(TimeRate)下流逝的现实时间
-            double timeTo01c_sec = tau_phys_sec / std::max(1e-9f, GameArgs.TimeRate);
+            double timeTo01c_sec = tau_phys_sec / std::fmax(1e-9f, GameArgs.TimeRate);
 
             if (timeTo01c_sec < 60.0) ImGui::Text("Real time to 0.1c: %.2f sec", timeTo01c_sec);
             else if (timeTo01c_sec < 3600.0) ImGui::Text("Real time to 0.1c: %.2f min", timeTo01c_sec / 60.0);
@@ -3631,9 +4040,12 @@ void FApplication::RenderDebugUI()
     if (shouldRecord)
     {
         g_TotalOdometer += stepDist;
-        g_TrajectoryHistory.push_back({ camPos, BlackHoleArgs.UniverseSign, g_TotalOdometer });
-    }
+        double current_t_ks = g_GeodesicMode ? g_GeoState[3] : BlackHoleArgs.BlackHoleTime;
+        bool current_isOut = g_GeodesicMode ? g_isOutgoing : false;
 
+        // [修改] 将当前的 InWhichUniverse 传入
+        g_TrajectoryHistory.push_back({ camPos, BlackHoleArgs.UniverseSign, g_TotalOdometer, current_t_ks, current_isOut, BlackHoleArgs.InWhichUniverse });
+    }
     // 清理队列：剔除超过最大长度阈值的尾部旧数据
     while (!g_TrajectoryHistory.empty() &&
         (g_TotalOdometer - g_TrajectoryHistory.front().Odometer) > MAX_TRAIL_LENGTH)
@@ -3661,36 +4073,40 @@ void FApplication::RenderDebugUI()
     draw_list->AddRectFilled(canvas_p0, ImVec2(canvas_p0.x + canvas_sz.x, canvas_p0.y + canvas_sz.y), bgColor);
 
     // 划分为左右两个视图
-    float halfWidth = canvas_sz.x * 0.5f;
-
-    // 左图原点移到靠左侧边缘，只用来展示正半轴
+    // 划分为左、中、右三个视图 [修改部分]
+    float thirdWidth = canvas_sz.x / 3.0f;
     float leftPadding = 30.0f;
     ImVec2 centerSide = ImVec2(canvas_p0.x + leftPadding, canvas_p0.y + canvas_sz.y * 0.5f);
-    ImVec2 centerTop = ImVec2(canvas_p0.x + halfWidth * 1.5f, canvas_p0.y + canvas_sz.y * 0.5f);
+    ImVec2 centerTop = ImVec2(canvas_p0.x + thirdWidth * 1.5f, canvas_p0.y + canvas_sz.y * 0.5f);
 
+    // Penrose 图由于是上下延伸的，我们将它的视觉中心 (tau = PI) 放在偏下方一点
+    ImVec2 centerPen = ImVec2(canvas_p0.x + thirdWidth * 2.5f, canvas_p0.y + canvas_sz.y * 0.6f);
     // 动态缩放逻辑
     float camDist = glm::length(camPos);
-    float displayRadius = std::max(1.5f, camDist * 1.2f);
-    float scale = std::min(halfWidth, canvas_sz.y) / (2.0f * displayRadius);
+    float displayRadius = std::fmax(1.5f, camDist * 1.2f);
+    float scale = std::min(thirdWidth, canvas_sz.y) / (2.0f * displayRadius);
 
+    // Penrose图缩放因子：保证总高度 3*PI 能装进面板
+    float scalePen = std::min(thirdWidth * 0.45f / M_PI, canvas_sz.y * 0.45f / (1.5f * M_PI));
     // 坐标转换 Lambda 工具
     auto ToSideScreen = [&](float x, float y) -> ImVec2 { return ImVec2(centerSide.x + x * scale, centerSide.y - y * scale); };
     auto ToTopScreen = [&](float x, float z) -> ImVec2 { return ImVec2(centerTop.x + x * scale, centerTop.y - z * scale); };
-
-    // 3. 绘制辅助网格和标题
+    // Penrose 坐标转换：以 tau = PI 作为中心基准点高度
+    // 绘制辅助网格和标题
     ImU32 axisColor = IM_COL32(100, 100, 100, 150);
-    draw_list->AddLine(ImVec2(centerSide.x, centerSide.y), ImVec2(canvas_p0.x + halfWidth, centerSide.y), axisColor, 1.0f);
+    draw_list->AddLine(ImVec2(centerSide.x, centerSide.y), ImVec2(canvas_p0.x + thirdWidth, centerSide.y), axisColor, 1.0f);
     draw_list->AddLine(ImVec2(centerSide.x, canvas_p0.y), ImVec2(centerSide.x, canvas_p0.y + canvas_sz.y), axisColor, 1.0f);
-
-    draw_list->AddLine(ImVec2(canvas_p0.x + halfWidth, centerTop.y), ImVec2(canvas_p0.x + canvas_sz.x, centerTop.y), axisColor, 1.0f);
+    draw_list->AddLine(ImVec2(canvas_p0.x + thirdWidth, centerTop.y), ImVec2(canvas_p0.x + thirdWidth * 2.0f, centerTop.y), axisColor, 1.0f);
     draw_list->AddLine(ImVec2(centerTop.x, canvas_p0.y), ImVec2(centerTop.x, canvas_p0.y + canvas_sz.y), axisColor, 1.0f);
-    draw_list->AddLine(ImVec2(canvas_p0.x + halfWidth, canvas_p0.y), ImVec2(canvas_p0.x + halfWidth, canvas_p0.y + canvas_sz.y), IM_COL32(200, 200, 200, 255), 2.0f);
 
+    // 面板分隔线
+    draw_list->AddLine(ImVec2(canvas_p0.x + thirdWidth, canvas_p0.y), ImVec2(canvas_p0.x + thirdWidth, canvas_p0.y + canvas_sz.y), IM_COL32(200, 200, 200, 255), 2.0f);
+    draw_list->AddLine(ImVec2(canvas_p0.x + thirdWidth * 2.0f, canvas_p0.y), ImVec2(canvas_p0.x + thirdWidth * 2.0f, canvas_p0.y + canvas_sz.y), IM_COL32(200, 200, 200, 255), 2.0f);
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Meridian (Y-X) Plane");
-    draw_list->AddText(ImVec2(canvas_p0.x + halfWidth + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Top-Down (X-(-Z)) Plane");
+    draw_list->AddText(ImVec2(canvas_p0.x + thirdWidth + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Top-Down (X-(-Z)) Plane");
+    draw_list->AddText(ImVec2(canvas_p0.x + thirdWidth * 2.0f + 10, canvas_p0.y + 10), IM_COL32(255, 255, 255, 255), "Carter-Penrose Diagram");
     std::string univText = !isAntiverse ? "Status: r > 0 (Universe)" : "Status: r < 0 (Antiverse)";
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 30), !isAntiverse ? IM_COL32(200, 255, 200, 255) : IM_COL32(255, 150, 150, 255), univText.c_str());
-
     // 图例说明
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 50), IM_COL32(255, 255, 0, 255), "Yellow: Look Dir");
     draw_list->AddText(ImVec2(centerSide.x + 10, canvas_p0.y + 65), IM_COL32(0, 255, 0, 255), "Green: Velocity");
@@ -3898,7 +4314,7 @@ void FApplication::RenderDebugUI()
 
     // 计算朝向矢量屏幕坐标
     float drho = (rho_cam > 1e-6f) ? ((camPos.x * camDir.x + camPos.z * camDir.z) / rho_cam) : std::sqrt(camDir.x * camDir.x + camDir.z * camDir.z);
-    float camLineLen = std::max(1.5f, camDist * 0.15f);
+    float camLineLen = std::fmax(1.5f, camDist * 0.15f);
     ImVec2 camSideDir = ToSideScreen(rho_cam + drho * camLineLen, camPos.y + camDir.y * camLineLen);
     ImVec2 camTopDir = ToTopScreen(camPos.x + camDir.x * camLineLen, -camPos.z - camDir.z * camLineLen);
 
@@ -3930,7 +4346,197 @@ void FApplication::RenderDebugUI()
         draw_list->AddLine(camTopPos, camTopDir, camColor, 2.0f);
         draw_list->AddCircleFilled(camTopPos, 5.0f, camColor);
     }
+    // ==========================================
+// [新增] 8. 绘制 Penrose 图背景网格与轨迹
+// ==========================================
+    // ==========================================
+    // [修改] Penrose 坐标转换与视野跟随
+    // ==========================================
+    // 根据当前宇宙索引动态偏移视口，使当前宇宙始终居中
+    float view_tau_offset = BlackHoleArgs.InWhichUniverse * (2.0f * M_PI);
+    auto ToPenScreen = [&](float chi, float tau) -> ImVec2
+    {
+        return ImVec2(centerPen.x + chi * scalePen, centerPen.y - (tau - view_tau_offset - M_PI) * scalePen);
+    };
 
+    auto KS_to_Penrose = [&](double t, double r, double r_plus, double r_minus, double kp, double km, bool isOut, int univIndex) -> ImVec2
+    {
+        double U = 0, V = 0;
+        // [新增] 每个宇宙层级跨越 2*PI 的高度
+        double shift_tau = univIndex * (2.0 * M_PI);
+        double shift_chi = 0.0;
+
+        if (!isOut) // Ingoing (落入黑洞)
+        {
+            if (r >= r_minus)
+            {
+                // I区 和 II区
+                U = -(r - r_plus) / r_plus * std::pow(std::abs((r - r_minus) / r_minus), kp / km) * std::exp(-kp * (t - r));
+                V = std::exp(kp * (t + r));
+            }
+            else
+            {
+                // III'区 (内部奇点区)
+                // [修复] 将 (r_minus - r) 因子置于 U 上，确保 entry point 位于菱形底部，时间流向正上方
+                U = (r_minus - r) / r_minus * std::pow(std::abs((r - r_plus) / r_plus), km / kp) * std::exp(-km * (t - r));
+                V = -std::exp(km * (t + r));
+                shift_tau += M_PI;
+            }
+        }
+        else // Outgoing (逃逸白洞)
+        {
+            if (r >= r_minus)
+            {
+                // 上方新 I区 和 IV区(白洞内部)
+                U = -std::exp(-kp * (t - r));
+                V = (r - r_plus) / r_plus * std::pow(std::abs((r - r_minus) / r_minus), kp / km) * std::exp(kp * (t + r));
+                shift_tau += 2.0 * M_PI;
+            }
+            else
+            {
+                // III'区 向外反弹逃逸 
+                // [修复] 与 Ingoing 共享完全相同的坐标映射，完美承接反弹轨迹
+                U = (r_minus - r) / r_minus * std::pow(std::abs((r - r_plus) / r_plus), km / kp) * std::exp(-km * (t - r));
+                V = -std::exp(km * (t + r));
+                shift_tau += M_PI;
+            }
+        }
+
+        double tU = std::atan(U);
+        double tV = std::atan(V);
+        double tau = tV + tU + shift_tau;
+        double chi = tV - tU + shift_chi;
+        return ImVec2((float)chi, (float)tau);
+    }; // ==========================================
+    // [新增] 9. 绘制 Penrose 图无限塔背景网格
+    // ==========================================
+    // ==========================================
+    // [修改] 9. 绘制 Penrose 图无限塔背景网格
+    // ==========================================
+    if (!isNakedSingularity)
+    {
+        double r_plus = M + std::sqrt(delta_discriminant);
+        double r_minus = M - std::sqrt(delta_discriminant);
+        double kappa_plus = (r_plus - r_minus) / (2.0 * (r_plus * r_plus + a2));
+        double kappa_minus = (r_minus - r_plus) / (2.0 * (r_minus * r_minus + a2));
+        auto DrawPLine = [&](float c1, float t1, float c2, float t2, ImU32 col, float thick = 1.5f)
+        {
+            draw_list->AddLine(ToPenScreen(c1, t1), ToPenScreen(c2, t2), col, thick);
+        };
+        auto DrawZigZag = [&](float c1, float t1, float c2, float t2, ImU32 col)
+        {
+            int steps = 15;
+            float dc = (c2 - c1) / steps;
+            float dt = (t2 - t1) / steps;
+            ImVec2 p_prev = ToPenScreen(c1, t1);
+            for (int i = 1; i <= steps; ++i)
+            {
+                float offset = (i % 2 == 0) ? 0.08f : -0.08f;
+                if (i == steps) offset = 0.0f;
+                float len = std::sqrt(dc * dc + dt * dt);
+                float nx = -dt / len * offset;
+                float ny = dc / len * offset;
+                ImVec2 p_next = ToPenScreen(c1 + i * dc + nx, t1 + i * dt + ny);
+                draw_list->AddLine(p_prev, p_next, col, 2.0f);
+                p_prev = p_next;
+            }
+        };
+
+        ImU32 colPInf = IM_COL32(100, 255, 100, 150);
+        ImU32 colPHorOut = IM_COL32(255, 100, 100, 200);
+        ImU32 colPHorIn = IM_COL32(100, 150, 255, 200);
+        ImU32 colPSing = IM_COL32(255, 50, 255, 200);
+        bool showAllPenrose = (BlackHoleArgs.Whitehole != 0);
+
+        // [新增] 动态绘制相邻的 3 个宇宙，形成无限延伸视觉
+        int current_univ = BlackHoleArgs.InWhichUniverse;
+        for (int u = current_univ - 1; u <= current_univ + 1; ++u)
+        {
+            float b_tau = u * (2.0f * M_PI); // 当前宇宙的基础高度基准
+
+            // 底部 I 区与 I' 区
+            DrawPLine(M_PI / 2, b_tau - M_PI / 2, M_PI, b_tau + 0, colPInf);
+            DrawPLine(M_PI, b_tau + 0, M_PI / 2, b_tau + M_PI / 2, colPInf);
+            DrawPLine(-M_PI / 2, b_tau - M_PI / 2, -M_PI, b_tau + 0, colPInf);
+            DrawPLine(-M_PI, b_tau + 0, -M_PI / 2, b_tau + M_PI / 2, colPInf);
+            DrawPLine(0, b_tau + 0, M_PI / 2, b_tau - M_PI / 2, colPHorIn);
+            DrawPLine(0, b_tau + 0, -M_PI / 2, b_tau - M_PI / 2, colPHorIn);
+            DrawPLine(0, b_tau + 0, M_PI / 2, b_tau + M_PI / 2, colPHorOut);
+            DrawPLine(0, b_tau + 0, -M_PI / 2, b_tau + M_PI / 2, colPHorOut);
+
+            // II 区 (黑洞内部)
+            DrawPLine(M_PI / 2, b_tau + M_PI / 2, 0, b_tau + M_PI, colPHorIn);
+            DrawPLine(-M_PI / 2, b_tau + M_PI / 2, 0, b_tau + M_PI, colPHorIn);
+
+            // III 区与 III' 区
+            DrawPLine(0, b_tau + M_PI, M_PI / 2, b_tau + 3 * M_PI / 2, colPHorOut);
+            DrawPLine(0, b_tau + M_PI, -M_PI / 2, b_tau + 3 * M_PI / 2, colPHorOut);
+            DrawZigZag(M_PI, b_tau + M_PI / 2, M_PI, b_tau + 3 * M_PI / 2, colPSing);
+            DrawZigZag(-M_PI, b_tau + M_PI / 2, -M_PI, b_tau + 3 * M_PI / 2, colPSing);
+            DrawPLine(M_PI / 2, b_tau + M_PI / 2, M_PI, b_tau + M_PI, IM_COL32(100, 100, 100, 100));
+            DrawPLine(M_PI / 2, b_tau + 3 * M_PI / 2, M_PI, b_tau + M_PI, IM_COL32(100, 100, 100, 100));
+            DrawPLine(-M_PI / 2, b_tau + M_PI / 2, -M_PI, b_tau + M_PI, IM_COL32(100, 100, 100, 100));
+            DrawPLine(-M_PI / 2, b_tau + 3 * M_PI / 2, -M_PI, b_tau + M_PI, IM_COL32(100, 100, 100, 100));
+
+            if (showAllPenrose)
+            {
+                // IV 区 (白洞内部) 及 顶端新 I 区
+                DrawPLine(M_PI / 2, b_tau + 3 * M_PI / 2, 0, b_tau + 2 * M_PI, colPHorIn);
+                DrawPLine(-M_PI / 2, b_tau + 3 * M_PI / 2, 0, b_tau + 2 * M_PI, colPHorIn);
+                DrawPLine(M_PI / 2, b_tau + 3 * M_PI / 2, M_PI, b_tau + 2 * M_PI, colPInf);
+                DrawPLine(M_PI, b_tau + 2 * M_PI, M_PI / 2, b_tau + 5 * M_PI / 2, colPInf);
+                DrawPLine(-M_PI / 2, b_tau + 3 * M_PI / 2, -M_PI, b_tau + 2 * M_PI, colPInf);
+                DrawPLine(-M_PI, b_tau + 2 * M_PI, -M_PI / 2, b_tau + 5 * M_PI / 2, colPInf);
+                DrawPLine(0, b_tau + 2 * M_PI, M_PI / 2, b_tau + 5 * M_PI / 2, colPHorOut);
+                DrawPLine(0, b_tau + 2 * M_PI, -M_PI / 2, b_tau + 5 * M_PI / 2, colPHorOut);
+            }
+            else
+            {
+                // 若关闭白洞，只框选当前宇宙的底部
+                ImVec2 boxMin = ToPenScreen(-M_PI / 2 - 0.2f, b_tau + 3 * M_PI / 2 + 0.2f);
+                ImVec2 boxMax = ToPenScreen(M_PI + 0.2f, b_tau - M_PI / 2 - 0.2f);
+                if (u == current_univ) draw_list->AddRect(boxMin, boxMax, IM_COL32(0, 255, 0, 255), 0.0f, 0, 3.0f);
+            }
+        }
+        // --- 10. 绘制轨迹映射到 Penrose 图上的坐标 ---
+        ImVec2 prev_pen;
+        bool has_prev_pen = false;
+
+        for (size_t i = 0; i < g_TrajectoryHistory.size(); ++i)
+        {
+            const auto& pt = g_TrajectoryHistory[i];
+
+            // 恢复该点的 BL 半径
+            float r_ui_b = (pt.Pos.x * pt.Pos.x + pt.Pos.y * pt.Pos.y + pt.Pos.z * pt.Pos.z) - a2;
+            float r_ui_c = a2 * pt.Pos.y * pt.Pos.y;
+            float r_pt_bl = std::sqrt(std::fmax(0.0f, 0.5f * (r_ui_b + std::sqrt(r_ui_b * r_ui_b + 4.0f * r_ui_c))));
+
+            // [修改] 传入 pt.UnivIndex
+            ImVec2 pen_pos = KS_to_Penrose(pt.t_ks, r_pt_bl, r_plus, r_minus, kappa_plus, kappa_minus, pt.isOut, pt.UnivIndex);
+            ImVec2 screen_pen = ToPenScreen(pen_pos.x, pen_pos.y);
+            // ... (其余不变)
+
+            float trailDepth = g_TotalOdometer - pt.Odometer;
+            float alpha = std::clamp(1.0f - (trailDepth / 600.0f), 0.0f, 1.0f);
+            ImU32 col = IM_COL32(0, 200, 255, (int)(alpha * 255));
+
+            // 避免因跨越宇宙翻转而在图表上拉出水平横跨连线
+            if (has_prev_pen && i > 0 &&
+                g_TrajectoryHistory[i - 1].UniverseSign == pt.UniverseSign &&
+                g_TrajectoryHistory[i - 1].isOut == pt.isOut)
+            {
+                draw_list->AddLine(prev_pen, screen_pen, col, 1.5f);
+            }
+            prev_pen = screen_pen;
+            has_prev_pen = true;
+        }
+        // 画出高亮的玩家当前坐标点
+        // 画出高亮的玩家当前坐标点
+        double current_t_ks = g_GeodesicMode ? g_GeoState[3] : BlackHoleArgs.BlackHoleTime;
+        bool current_isOut = g_GeodesicMode ? g_isOutgoing : false;
+        // [修改] 传入 BlackHoleArgs.InWhichUniverse
+        ImVec2 curr_pen_pos = KS_to_Penrose(current_t_ks, std::abs(r_ui), r_plus, r_minus, kappa_plus, kappa_minus, current_isOut, BlackHoleArgs.InWhichUniverse);
+        draw_list->AddCircleFilled(ToPenScreen(curr_pen_pos.x, curr_pen_pos.y), 4.0f, IM_COL32(255, 255, 0, 255)); }
     ImGui::End();
 }
 _NPGS_END

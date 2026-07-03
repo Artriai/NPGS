@@ -95,6 +95,7 @@ struct FBlackHoleArgs
     float BlackbodyIntensityExponent;
     float RedShiftColorExponent;
     float RedShiftIntensityExponent;
+    float ImageRotationSpeed;
     float PolarizationAngle;
     float HeatHaze;
     float BackgroundBrightmut;

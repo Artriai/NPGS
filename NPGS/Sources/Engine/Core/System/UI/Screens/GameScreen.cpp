@@ -150,6 +150,8 @@ void GameScreen::OnEnter()
         menu->AddThrottle("BlackbodyIntensityExponent", &BlackHoleArgs.BlackbodyIntensityExponent);
         menu->AddThrottle("RedShiftColorExponent", &BlackHoleArgs.RedShiftColorExponent);
         menu->AddThrottle("RedShiftIntensityExponent", &BlackHoleArgs.RedShiftIntensityExponent);
+        menu->AddThrottle("ImageRotationSpeed", &BlackHoleArgs.ImageRotationSpeed);
+
         menu->AddLinear("PolarizationAngle", &BlackHoleArgs.PolarizationAngle,0.0f, 6.28318530716f);
 		menu->AddThrottle("HeatHaze", &BlackHoleArgs.HeatHaze);
 		menu->AddThrottle("BackgroundBrightmut", &BlackHoleArgs.BackgroundBrightmut);
@@ -244,6 +246,7 @@ void GameScreen::OnEnter()
         };
         vn_button->on_execute_callback = [this](const std::string& id, const std::string& val)
         {
+            m_context.Application->Command(val);
             NpgsCoreInfo("LAUNCHING 冯诺依曼探测器. Mass: {}", val);
         };
     }

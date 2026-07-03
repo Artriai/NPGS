@@ -21,6 +21,8 @@ FCamera::FCamera(const glm::vec3& Position, float Sensitivity, float Speed, floa
     _OffsetY(0.0f),
     _ObjectivetOffsetX(0.0f),
     _ObjectivetOffsetY(0.0f),
+    _ObjectiveRoll(0.0f),
+    _RollSmoothCoefficient(1.0f / 3.0f), // 3秒到位特征时间对应的衰减常数
     _AxisDir(0.0f, 1.0f, 0.0f),
     _ObjectivetAxisDir(0.0f, 1.0f, 0.0f),
     _OrbitalCenter(0.0f, 0.0f, 0.0f),
@@ -209,12 +211,19 @@ void FCamera::ProcessTimeEvolution(double DeltaTime)
             float Velocity = static_cast<float>(_Speed * DeltaTime);
             _Position += NormalizedDirection * Velocity;
         }
-
+        // ================= 修改和新增部分 =================
         float RollVelocity = 300.0f * 0.25f * static_cast<float>(DeltaTime);
+
+        // 1. 将按键输入的理想Roll位移注入到待处理目标中
+        _ObjectiveRoll += _InputRollValue * RollVelocity;
+        // 2. 使用阻尼算法计算本帧消耗的Roll角度
+        double rollSmoothFactor = 1.0 - exp(-_RollSmoothCoefficient * static_cast<double>(DeltaTime));
+        double ConsumeRoll = _ObjectiveRoll * rollSmoothFactor;
+        _ObjectiveRoll -= ConsumeRoll;
         float HorizontalAngle = static_cast<float>(_Sensitivity * -ConsumeX);
         float VerticalAngle = static_cast<float>(_Sensitivity * -ConsumeY);
-
-        ProcessRotation(HorizontalAngle, VerticalAngle, _InputRollValue * RollVelocity);
+        // 3. 应用平滑后的 ConsumeRoll
+        ProcessRotation(HorizontalAngle, VerticalAngle, static_cast<float>(ConsumeRoll));
     }
     else
     {
@@ -296,7 +305,7 @@ void FCamera::TeleportOrbit(float Yaw, float Pitch)
     _ObjectivetOffsetX = 0.0;
     _ObjectivetOffsetY = 0.0;
     _InputOrbitAxis = glm::vec2(0.0f);
-
+    _ObjectiveRoll = 0.0f;
     _ObjectiveSwayYaw = 0.0f;
     _ObjectiveSwayPitch = 0.0f;
     _CurrentSwayYaw = 0.0f;

@@ -1,4 +1,4 @@
-#pragma once
+ #pragma once
 
 #include "../IScreen.h"
 #include "../neural_ui.h"

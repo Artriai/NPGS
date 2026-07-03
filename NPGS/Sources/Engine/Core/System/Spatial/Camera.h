@@ -104,11 +104,14 @@ private:
     float     _OrbitDistanceRotationSmoothCoefficient;
     float     _OrbitCenterChangeSmoothCoefficient;
     float     _OrbitAxisChangeSmoothCoefficient;
+    float     _RollSmoothCoefficient; // 到位特征时间3秒
     float     _Sensitivity;
     float     _Speed;
     float     _Zoom;
     float     _ObjectivetOffsetX;
     float     _ObjectivetOffsetY;
+    float     _ObjectiveRoll{ 0.0f };
+
     float     _OffsetX;
     float     _OffsetY;
     float     _TimeSinceModeChange;

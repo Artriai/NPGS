@@ -78,6 +78,7 @@ layout(set = 0, binding = 1) uniform BlackHoleArgs
     float iBlackbodyIntensityExponent;   //吸积盘温度——黑体颜色指数
     float iRedShiftColorExponent;        //吸积盘频移——温度指数
     float iRedShiftIntensityExponent;    //吸积盘频移——亮度指数
+    float iImageRotationSpeed;           //图片整体自转角速度
 
     float iPolarizationAngle;            //偏振片模式偏振片角度
 
@@ -931,23 +932,16 @@ vec3 DebugInitialMomentum(
 
 
 // =============================================================================
-// Walker-Penrose 常数计算 (Kerr-Newman 适配版)
+// Walker-Penrose 常数计算 (M=0.5 Kerr-Newman 适配版)
 // 输入:
 //   X:     光子位置 (Cartesian KS, Y轴为自旋轴)
 //   P_cov: 光子下指标动量 P_mu
 //   F_cov: 光子下指标偏振 f_mu
-//   a:     有量纲自旋参数
-//   Q:     有量纲电荷参数
+//   a:     有量纲自旋参数（0.5a*）
+//   Q:     有量纲电荷参数（0.5Q*）
 //   r:     由 KerrSchildRadius 算得的有符号半径
 // 返回:
-//   vec2:  Walker-Penrose 常数的 (实部, 虚部)
-// =============================================================================
-// Walker-Penrose常数计算
-// 输入：X = (x, y, z, t) 为ingoing Kerr-Schild笛卡尔坐标
-//       P_cov = 协变四动量 (P_x, P_y, P_z, P_t)
-//       F_cov = 协变偏振矢量 (f_x, f_y, f_z, f_t)，实数
-//       Physicala = 自旋参数a，PhysicalQ = 电荷Q，r = 径向椭球坐标（可正负）
-// 输出：vec2(K_re, K_im)，即复常数 K = k_μν P^μ f^ν + i h_μν P^μ f^ν
+//   vec2:  Walker-Penrose 常数的 (实部, 虚部)即复常数 K = k_μν P^μ f^ν + i h_μν P^μ f^ν
 vec2 GetWalkerPenrose(vec4 X, vec4 P_cov, vec4 F_cov, float Physicala, float PhysicalQ, float r) {
     if (abs(r) < 1e-6) return vec2(0.0); // 避免奇点
 
@@ -977,44 +971,40 @@ vec2 GetWalkerPenrose(vec4 X, vec4 P_cov, vec4 F_cov, float Physicala, float Phy
     // ========== 1. 转换 P_cov (KS) → BL 协变分量 ==========
     float P_t = P_cov.w;
     float P_x = P_cov.x, P_y = P_cov.y, P_z = P_cov.z;
-
-    float P_r_BL = (r2a2) * invDelta * P_t
-                 + (x * r / r2a2) * P_x
-                 + (y / r) * P_y
-                 + (z * r / r2a2) * P_z;
-
-    // P_φ (无奇异)
+    
+    // 正确提取角动量
     float P_phi_BL = x * P_z - z * P_x;
-
-    // P_θ (无奇异)
+    
+    // 修正后的光子动量转换
+    float P_r_BL = ( (r2a2) * invDelta - 1.0 ) * P_t 
+                 + (Physicala * invDelta) * P_phi_BL  // 必须是正号
+                 + ((x * r + Physicala * z) / r2a2) * P_x // 注意是 + a*z
+                 + (y / r) * P_y
+                 + ((z * r - Physicala * x) / r2a2) * P_z; // 注意是 - a*x
+    
     float P_theta_BL = 0.0;
     float xPx_zPz = x * P_x + z * P_z;
     if (!onAxis) {
         P_theta_BL = cosTheta * sqrt_r2a2 * (xPx_zPz / R) - r * sinTheta * P_y;
-    } else {
-        // 极轴上 x=z=0，sinθ=0，该项为 0
-        P_theta_BL = 0.0;
     }
 
     // ========== 2. 转换 f_cov (KS) → BL 协变分量 ==========
+    // 对偏振矢量执行完全相同的雅可比变换
     float f_t = F_cov.w;
     float f_x = F_cov.x, f_y = F_cov.y, f_z = F_cov.z;
-
-    float f_r_BL = (r2a2) * invDelta * f_t
-                 + (x * r / r2a2) * f_x
-                 + (y / r) * f_y
-                 + (z * r / r2a2) * f_z;
-
     float f_phi_BL = x * f_z - z * f_x;
-
+    float f_r_BL = ( (r2a2) * invDelta - 1.0 ) * f_t 
+                 + (Physicala * invDelta) * f_phi_BL
+                 + ((x * r + Physicala * z) / r2a2) * f_x
+                 + (y / r) * f_y
+                 + ((z * r - Physicala * x) / r2a2) * f_z;
+    
     float f_theta_BL = 0.0;
     float xfx_zfz = x * f_x + z * f_z;
     if (!onAxis) {
         f_theta_BL = cosTheta * sqrt_r2a2 * (xfx_zfz / R) - r * sinTheta * f_y;
-    } else {
-        f_theta_BL = 0.0;
     }
-
+    
     // ========== 3. 度规逆分量（无奇异） ==========
     float g_tphi = -a * (r - Q * Q) * invSigma * invDelta;   // 2Mr - Q^2
     float g_tt = -((r2a2) * (r2a2) - Delta * a2 * sinTheta2) * invSigma * invDelta;
@@ -1801,15 +1791,24 @@ vec4 DiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
                      SampleColor.xyz *= min(1.0, 1.3 * (OuterRadius - PosR) / (OuterRadius - InterRadius)); 
                      SampleColor.a   *= 0.125;
                      
+                     // 1. 计算 DilutionOuterRadius 并替换 BoostFactor 中的 OuterRadius
+                     float DilutionOuterRadius = mix(min(OuterRadius, 25.0), OuterRadius, smoothstep(6.0, max(0.05 * OuterRadius, 12.0), PosR));
                      vec4 BoostFactor = max(
-                        mix(vec4(5.0 / (max(Thin, 0.2) + (0.0 + Hopper * 0.5) * OuterRadius)), vec4(vec3(0.3 + 0.7 * 5.0 / (Thin + (0.0 + Hopper * 0.5) * OuterRadius)), 1.0), 0.0),
-                        mix(vec4(100.0 / OuterRadius), vec4(vec3(0.3 + 0.7 * 100.0 / OuterRadius), 1.0), exp(-pow(20.0 * PosR / OuterRadius, 2.0)))
+                        mix(vec4(5.0 / (max(Thin, 0.2) + (0.0 + Hopper * 0.5) * DilutionOuterRadius)), vec4(vec3(0.3 + 0.7 * 5.0 / (Thin + (0.0 + Hopper * 0.5) * DilutionOuterRadius)), 1.0), 0.0),
+                        mix(vec4(100.0 / DilutionOuterRadius), vec4(vec3(0.3 + 0.7 * 100.0 / DilutionOuterRadius), 1.0), exp(-pow(20.0 * PosR / DilutionOuterRadius, 2.0)))
                      );
                      SampleColor *= BoostFactor;
+                     
+                     // 2. 计算内圈增亮参数
+                     float InnerBrightenFac = mix(3.0, 2.0, clamp((OuterRadius - 50.0) / 50.0, 0.0, 1.0));
+                     float InnerBrightenRatio = 1.0 - clamp(6.0 * (PosR - InterRadius) / (OuterRadius - InterRadius), 0.0, 1.0);
+                     InnerBrightenRatio *= InnerBrightenRatio;
+                     
+                     // 3. 分层应用颜色与透明度的微调 (保留了原有的分行清晰度)
                      SampleColor.xyz *= mix(1.0, max(1.0, abs(local_Dir.y) / 0.2), clamp(0.3 - 0.6 * (PerturbedThickness / max(1e-6, Density) - 1.0), 0.0, 0.3));
                      SampleColor.xyz *= 1.0 + 1.2 * max(0.0, max(0.0, min(1.0, 3.0 - 2.0 * Thin)) * min(0.5, 1.0 - 5.0 * Hopper));
-                     SampleColor.xyz *= Brightmut * clamp(4.0 - 18.0 * (PosR - InterRadius) / (OuterRadius - InterRadius), 1.0, 4.0);
-                     SampleColor.a   *= Darkmut * clamp(5.0 - 24.0 * (PosR - InterRadius) / (OuterRadius - InterRadius), 1.0, 5.0);
+                     SampleColor.xyz *= Brightmut * (1.0 + InnerBrightenFac * InnerBrightenRatio);
+                     SampleColor.a   *= Darkmut * (1.0 + (1.0 + InnerBrightenFac) * InnerBrightenRatio);
                      
                      if (E_emit < 0.0) 
                      {
@@ -2661,6 +2660,7 @@ vec4 ImageDiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
     }
 
     // --- 将坐标映射回统一的 Ingoing 参考系 ---
+       // --- 将坐标映射回统一的 Ingoing 参考系 ---
     float HitTime_disk = DiskHitX.w;
     vec3 PatternPosDisk = DiskHitPos;
     if (isoutgoing) {
@@ -2669,6 +2669,7 @@ vec4 ImageDiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
         float diskSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
         transformKerrSchild_YSpin(tempX, diskSign, dummyP, 0.5, PhysicalSpinA, PhysicalQ, true);
         PatternPosDisk = tempX.xyz;
+        HitTime_disk = tempX.w; // 顺手补上时间的更新，保证光线时间滞后计算精确
     }
 
     // --- 几何与纹理映射逻辑 ---
@@ -2676,17 +2677,26 @@ vec4 ImageDiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
     // 挖去内部孔洞
     if (r_xz < InterRadius) return CurrentResult;
 
+    // 【新增：计算旋转角并对坐标进行矩阵旋转】
+    float EmissionTime = iBlackHoleTime + HitTime_disk; // 提取光线命中该位置时的物理世界时间
+    float rotAngle = iImageRotationSpeed * EmissionTime; // <- 注意：请确保名字与你传入的 uniform 变量名一致
+    float cosA = cos(rotAngle);
+    float sinA = sin(rotAngle);
+    
+    // 对坐标进行反向矩阵旋转（等效于图片本身正向旋转）
+    vec2 RotatedXZ = mat2(cosA, sinA, -sinA, cosA) * PatternPosDisk.xz;
+
     // 根据对角线为 OuterRadius 计算正方形边长
     // 对角线 D = OuterRadius，正方形边长 S = D / sqrt(2)
     float ImageWidth = OuterRadius * 0.70710678; 
     float HalfWidth = ImageWidth * 0.5;
 
-    // 剔除正方形边界之外的区域
-    if (abs(PatternPosDisk.x) > HalfWidth || abs(PatternPosDisk.z) > HalfWidth) return CurrentResult;
+    // 剔除正方形边界之外的区域 (改用旋转后的 RotatedXZ)
+    if (abs(RotatedXZ.x) > HalfWidth || abs(RotatedXZ.y) > HalfWidth) return CurrentResult;
 
-    // 映射到 [0, 1] 的 UV 坐标
-    float U = (PatternPosDisk.x + HalfWidth) / ImageWidth;
-    float V = (PatternPosDisk.z + HalfWidth) / ImageWidth;
+    // 映射到 [0, 1] 的 UV 坐标 (改用旋转后的 RotatedXZ)
+    float U = (RotatedXZ.x + HalfWidth) / ImageWidth;
+    float V = (RotatedXZ.y + HalfWidth) / ImageWidth;
 
     // 使用 textureLod 避免由于控制流分支导致计算 mipmap 梯度报错
     vec4 TexColor = textureLod(iImageTexture, vec2(U, V), 0.0);
@@ -2698,19 +2708,26 @@ vec4 ImageDiskColor(vec4 BaseColor, vec4 RayPos, vec4 LastRayPos,
     vec4 HitP_cov = mix(LastP_cov, P_cov, t_cross);
 
     // 计算静止物体 (U_spatial = 0) 局部能量 E_emit
-    vec4 U_zero = vec4(0.0, 0.0, 0.0, 1.0); 
+    // 计算带有圆轨道速度（开普勒运动）的局部能量 E_emit
     KerrGeometry geo_hit;
     float hitSign = (length(DiskHitPos.xz) < abs(PhysicalSpinA)) ? -StartStepSign : StartStepSign;
     ComputeGeometryScalars(DiskHitPos, PhysicalSpinA, PhysicalQ, 1.0, hitSign, isoutgoing, geo_hit);
 
-    vec4 U_lower = LowerIndex(U_zero, geo_hit);
-    float norm_sq = dot(U_zero, U_lower);
-    float norm = sqrt(max(1e-9, abs(norm_sq)));
-    vec4 U_static = U_zero / norm;
+    // 获取当前交点的等效半径，并算出对应的开普勒角速度（内部有限制防止在半径极小处崩溃）
+    float PosR = KerrSchildRadius(DiskHitPos, PhysicalSpinA, hitSign);
+    float AngularVelocity = GetKeplerianAngularVelocity(max(InterRadius, PosR), 1.0, PhysicalSpinA, PhysicalQ);
+    
+    // 构造带圆轨道旋转的未归一化四维速度，自旋方向为Y轴 (v_x = -Omega * z, v_z = Omega * x)
+    vec4 U_unnorm = vec4(AngularVelocity * DiskHitPos.z, 0.0, -AngularVelocity * DiskHitPos.x, 1.0);
+
+    vec4 U_lower = LowerIndex(U_unnorm, geo_hit);
+    float norm_sq = dot(U_unnorm, U_lower);
+    float norm = sqrt(max(1e-9, abs(norm_sq))); // 取绝对值并加上容差避免极端超光速情况下的崩溃
+    vec4 U_orbit = U_unnorm / norm;
 
     // 发射能量 = - P_mu * U^mu
-    float E_emit = -dot(HitP_cov, U_static); 
-    float Shift = 1.0 / max(1e-6, abs(E_emit)); 
+    float E_emit = -dot(HitP_cov, U_orbit); 
+    float Shift = 1.0 / max(1e-6, abs(E_emit));
 
     // --- 非黑体天空盒风格频移逻辑 ---
     float EffectiveColorShift = pow(Shift, RedShiftColorExponent);

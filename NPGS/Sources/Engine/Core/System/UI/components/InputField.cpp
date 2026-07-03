@@ -424,11 +424,63 @@ bool InputField::HandleKeyboardEvent()
     bool handled = false;
 
     bool is_ctrl_a = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A));
+    bool is_ctrl_c = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C));
+    bool is_ctrl_x = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_X));
+    bool is_ctrl_v = (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_V));
 
+    // Ctrl + A : 全选
     if (is_ctrl_a)
     {
         SelectAll();
         handled = true;
+    }
+
+    // Ctrl + C : 复制
+    if (is_ctrl_c && HasSelection())
+    {
+        int s, e;
+        GetSelectionBounds(s, e);
+        std::string selected_text = m_target_string->substr(s, e - s);
+        ImGui::SetClipboardText(selected_text.c_str());
+        handled = true;
+    }
+
+    // Ctrl + X : 剪切
+    if (is_ctrl_x && HasSelection())
+    {
+        int s, e;
+        GetSelectionBounds(s, e);
+        std::string selected_text = m_target_string->substr(s, e - s);
+        ImGui::SetClipboardText(selected_text.c_str());
+        DeleteSelection(); // 剪切后删除选区
+        handled = true;
+    }
+
+    // Ctrl + V : 粘贴
+    if (is_ctrl_v)
+    {
+        const char* clipboard_text = ImGui::GetClipboardText();
+        if (clipboard_text && clipboard_text[0] != '\0')
+        {
+            // 如果当前有选区，先将选区内容删掉
+            if (HasSelection()) DeleteSelection();
+
+            // 过滤剪贴板文本 (单行输入框通常不允许粘贴换行符)
+            std::string text_to_insert;
+            for (int i = 0; clipboard_text[i] != '\0'; ++i)
+            {
+                char c = clipboard_text[i];
+                if (c == '\r' || c == '\n') break; // 遇到换行直接截断，或者用 continue 忽略
+                text_to_insert += c;
+            }
+
+            // 插入文本并移动光标
+            m_target_string->insert(m_cursor_pos, text_to_insert);
+            m_cursor_pos += text_to_insert.length();
+            ResetSelection(); // 粘贴后没有选区，锚点对齐光标
+
+            handled = true;
+        }
     }
 
     // 字符输入

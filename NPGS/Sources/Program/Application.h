@@ -43,7 +43,7 @@ public:
 
     void ExecuteMainRender();
     void Terminate();
-
+    void Command(const std::string& command);
 private:
     bool InitializeWindow();
     void InitializeInputCallbacks();
