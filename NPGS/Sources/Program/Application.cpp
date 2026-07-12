@@ -769,6 +769,7 @@ FApplication::FApplication(const vk::Extent2D& WindowSize, const std::string& Wi
     if (!InitializeWindow())
     {
         NpgsCoreError("Failed to create application.");
+        throw std::runtime_error("Failed to initialize the window or Vulkan runtime.");
     }
 }
 
@@ -3038,9 +3039,20 @@ bool FApplication::InitializeWindow()
     {
         // 获取主显示器
         PrimaryMonitor = glfwGetPrimaryMonitor();
-
+        if (PrimaryMonitor == nullptr)
+        {
+            NpgsCoreError("Failed to get the primary monitor.");
+            glfwTerminate();
+            return false;
+        }
 
         const GLFWvidmode* mode = glfwGetVideoMode(PrimaryMonitor);
+        if (mode == nullptr)
+        {
+            NpgsCoreError("Failed to get the primary monitor video mode.");
+            glfwTerminate();
+            return false;
+        }
         _WindowSize.width = mode->width;
         _WindowSize.height = mode->height;
 
