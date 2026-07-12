@@ -1,0 +1,74 @@
+name: Build Windows package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Export GitHub Actions cache variables
+        shell: pwsh
+        run: |
+          "ACTIONS_CACHE_URL=$env:ACTIONS_CACHE_URL" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ACTIONS_RUNTIME_TOKEN=$env:ACTIONS_RUNTIME_TOKEN" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Set up Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+          & "$env:RUNNER_TEMP\vcpkg\vcpkg.exe" integrate install
+          "VCPKG_ROOT=$env:RUNNER_TEMP\vcpkg" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build x64 package
+        shell: pwsh
+        run: |
+          & msbuild.exe NPGS.sln /m /t:Build `
+            /p:Configuration=Package `
+            /p:Platform=x64 `
+            /p:VcpkgRoot="$env:VCPKG_ROOT\" `
+            /p:VcpkgEnableManifest=true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Assemble portable package
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "NPGS-Windows-x64"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          Copy-Item "NPGS\Win64\NPGS.exe" $package
+          Get-ChildItem "NPGS\Win64" -Filter "*.dll" | Copy-Item -Destination $package
+          Copy-Item "NPGS\Assets" "$package\Assets" -Recurse
+          Copy-Item "NPGS\imgui.ini" $package
+          Compress-Archive -Path "$package\*" -DestinationPath "NPGS-Windows-x64.zip" -Force
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: NPGS-Windows-x64
+          path: NPGS-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

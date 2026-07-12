@@ -20,6 +20,7 @@
     "glm",
     "magic-enum",
     "spdlog",
+    "spirv-cross",
     "stb",
     "nlohmann-json"
   ],
