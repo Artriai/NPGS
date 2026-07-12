@@ -5,12 +5,26 @@
 #include <exception>
 #include <fstream>
 #include <memory>
+#include <windows.h>
 
 using namespace Npgs;
 using namespace Npgs::Util;
 
 int main()
 {
+    // This marker uses the Win32 API directly, so it also works before the
+    // logging library and the application runtime are initialized.
+    if (HANDLE StartupMarker = CreateFileW(
+            L"startup-stage.txt", GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        StartupMarker != INVALID_HANDLE_VALUE)
+    {
+        constexpr char Marker[] = "entered main\r\n";
+        DWORD BytesWritten = 0;
+        WriteFile(StartupMarker, Marker, sizeof(Marker) - 1, &BytesWritten, nullptr);
+        CloseHandle(StartupMarker);
+    }
+
     try
     {
         FLogger::Initialize();

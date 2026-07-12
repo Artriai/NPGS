@@ -239,7 +239,7 @@ spirv-cross-cpp.lib
       <PrecompiledHeader>Use</PrecompiledHeader>
     </ClCompile>
     <Link>
-      <SubSystem>Windows</SubSystem>
+      <SubSystem>Console</SubSystem>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -247,7 +247,6 @@ spirv-cross-cpp.lib
       <AdditionalDependencies>vulkan-1.lib;spirv-cross-core.lib;
 spirv-cross-cpp.lib
 ;spirv-cross-glsl.lib;spirv-cross-reflect.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
     </Link>
     <PreBuildEvent>
       <Command>
