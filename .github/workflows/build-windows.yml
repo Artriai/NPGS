@@ -64,6 +64,7 @@ jobs:
           New-Item -ItemType Directory -Path $package -Force | Out-Null
           Copy-Item "NPGS\Win64\NPGS.exe" $package
           Get-ChildItem "NPGS\Win64" -Filter "*.dll" | Copy-Item -Destination $package
+          Get-ChildItem "NPGS\Win64" -Filter "*.pdb" -ErrorAction SilentlyContinue | Copy-Item -Destination $package
           Copy-Item "NPGS\Assets" "$package\Assets" -Recurse
           Copy-Item "NPGS\imgui.ini" $package
           Compress-Archive -Path "$package\*" -DestinationPath "NPGS-Windows-x64.zip" -Force
