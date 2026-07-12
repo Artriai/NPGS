@@ -50,7 +50,7 @@ jobs:
       - name: Build x64 package
         shell: pwsh
         run: |
-          & msbuild.exe NPGS.sln /m /t:Build `
+          & msbuild.exe NPGS\NPGS.vcxproj /m /t:Build `
             /p:Configuration=Package `
             /p:Platform=x64 `
             /p:VcpkgRoot="$env:VCPKG_ROOT\" `
