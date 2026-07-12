@@ -75,9 +75,20 @@ void GameScreen::RegisterUIComponents()
     });
 }
 
-// 随机数生成器 (与原版保持一致)
-std::seed_seq seed{ std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count() };
-Npgs::System::Generator::FStellarGenerator Gen(seed, Npgs::System::Generator::FStellarGenerator::EStellarTypeGenerationOption::kRandom);
+// Construct the expensive generator on first use. A namespace-scope instance
+// runs before main(), where constructor failures cannot be logged or caught by
+// the application startup handler.
+static Npgs::System::Generator::FStellarGenerator& GetStellarGenerator()
+{
+    static std::seed_seq Seed
+    {
+        static_cast<std::uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count())
+    };
+    static Npgs::System::Generator::FStellarGenerator Generator(
+        Seed, Npgs::System::Generator::FStellarGenerator::EStellarTypeGenerationOption::kRandom);
+    return Generator;
+}
 
 void GameScreen::OnEnter()
 {
@@ -516,8 +527,9 @@ void GameScreen::SimulateStarSelectionAndUpdateUI()
 {
     if (!m_ui_root) return;
 
-    Npgs::Astro::AStar myStar = Gen.GenerateStar();
-    Gen.GenerateStar();
+    auto& Generator = GetStellarGenerator();
+    Npgs::Astro::AStar myStar = Generator.GenerateStar();
+    Generator.GenerateStar();
     Npgs::System::UI::CelestialData ui_data = Npgs::System::UI::AstroDataBuilder::BuildDataForObject(&myStar);
 
     if (auto panel = m_ui_root->FindElementAs<UI::CelestialInfoPanel>("gameScreenRoot.celestialInfoPanel"))
