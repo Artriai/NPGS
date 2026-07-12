@@ -22,6 +22,7 @@
     "spdlog",
     "spirv-cross",
     "stb",
+    "vulkan-memory-allocator",
     "nlohmann-json"
   ],
   "builtin-baseline": "782419385291ae2db643c928314efe626853c702"
